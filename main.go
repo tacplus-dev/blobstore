@@ -18,13 +18,11 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"time"
 
 	internal "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/internal/blobstore"
 	loggerchassis "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/chassis/logger"
 	sm "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/s2sm"
-	blobstore_pb "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/types/services/blobstore"
 	host_pb "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/types/sys/host"
 	"go.uber.org/zap"
 )
@@ -47,25 +45,30 @@ func run() error {
 	zap.ReplaceGlobals(logger)
 	defer logger.Sync() //nolint:errcheck
 
-	configPath := resolveConfigPath()
-	if configPath == "" {
-		return fmt.Errorf("no config: use --config flag or set SERVICE_CONFIG env var")
-	}
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return fmt.Errorf("reading config %s: %w", configPath, err)
-	}
-	cfg, err := blobstore_pb.ConfigFromBytes(data)
-	if err != nil {
-		return fmt.Errorf("parsing blobstore config %s: %w", configPath, err)
-	}
-	blobstore_pb.ConfigDefaults(cfg)
-
 	s, err := sm.New()
 	if err != nil {
 		return fmt.Errorf("servicemanager: %w", err)
 	}
 	defer s.Close()
+
+	// The typed Config comes from kernel, never from a file. The operator seeds
+	// blobstore's entry in kernel's services holder, and kernel republishes that
+	// entry to this service's own BlobstoreConfigState boundary; bootstrap.yaml
+	// carries only the identity needed to reach kernel. letsencrypt's
+	// service.yaml is the fleet's ONE exception to that, not its model.
+	//
+	// Fetch, not Get: Get reads the Watch cache, which is empty until the first
+	// message lands, so on a cold boot it returns nil — that nil is what
+	// crash-looped. Fetch is the blocking RPC against the state authority, and it
+	// already retries with the watch-restart backoff for
+	// config_fetch_timeout_seconds while a fetched value fails its own generated
+	// validation, which is what covers a boot racing kernel's own convergence.
+	// Nothing to hand-roll here: the generated wrapper is the timeout idiom.
+	ctx := context.Background()
+	cfg, err := s.StateClients().Services().BlobstoreConfigState().Config().Fetch(ctx)
+	if err != nil {
+		return fmt.Errorf("fetching blobstore config from BlobstoreConfigState: %w", err)
+	}
 
 	store, err := internal.NewStore(cfg.GetDataDir())
 	if err != nil {
@@ -100,7 +103,6 @@ func run() error {
 
 	// Anti-entropy BEFORE the listeners bind (R2): a pod with a replaced disk
 	// fills from its peer and only then accepts reads.
-	ctx := context.Background()
 	svc.SyncOnStart(ctx)
 
 	if err := serveHTTP("bytes", cfg.GetHttpListener(), svc.BytesHandler()); err != nil {
@@ -158,13 +160,4 @@ func serveHTTP(name string, h *host_pb.Host, handler http.Handler) error {
 	}()
 	zap.L().Info("listening", zap.String("listener", name), zap.String("addr", addr))
 	return nil
-}
-
-func resolveConfigPath() string {
-	for i := 1; i < len(os.Args)-1; i++ {
-		if os.Args[i] == "-c" || os.Args[i] == "--config" {
-			return os.Args[i+1]
-		}
-	}
-	return os.Getenv("SERVICE_CONFIG")
 }
