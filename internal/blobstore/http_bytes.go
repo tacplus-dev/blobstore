@@ -1,0 +1,334 @@
+package blobstore
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	blobstore_pb "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/types/services/blobstore"
+	"go.uber.org/zap"
+)
+
+// The two public byte paths (R3). Nothing else is served on this listener.
+const (
+	PathUpload = "/upload/"
+	PathBlob   = "/b/"
+)
+
+// BytesHandler is the public listener's router. It is deliberately a hand-written
+// prefix match rather than a mux: there are exactly two paths, both take the
+// credential as the whole remainder of the path, and a pattern-matching mux would
+// have to be told not to normalise or unescape that remainder.
+func (s *Service) BytesHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, PathUpload):
+			s.serveUpload(w, r, strings.TrimPrefix(r.URL.Path, PathUpload))
+		case strings.HasPrefix(r.URL.Path, PathBlob):
+			s.serveBlob(w, r, strings.TrimPrefix(r.URL.Path, PathBlob))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	return mux
+}
+
+// serveBlob resolves a bearer link and serves the bytes (R3, R7, R8).
+//
+// EVERY REFUSAL IS THE SAME 404. Unknown token, revoked link, expired link,
+// deleted blob, a blob this pod does not hold: one answer, no body, no header that
+// distinguishes them. The doc requires "unknown and revoked indistinguishable
+// 404s", and the reason generalises — any distinction at all turns this endpoint
+// into an oracle a holder of one token can use to learn about links it does not
+// hold.
+//
+// The one exception is 503, for a stratum this pod cannot read: that is not
+// information about the token, it is information about us (R11).
+func (s *Service) serveBlob(w http.ResponseWriter, r *http.Request, token string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "", http.StatusMethodNotAllowed)
+		return
+	}
+	if token == "" || strings.Contains(token, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	link, err := s.records.FetchLink(r.Context(), LinkTokenHash(token))
+	if err != nil {
+		zap.L().Error("failed to read BlobLink", zap.Error(err))
+		http.Error(w, "", http.StatusServiceUnavailable)
+		return
+	}
+	nowMs := s.now().UnixMilli()
+	if link == nil || link.GetDeleted() || link.GetRevokedMs() != 0 ||
+		(link.GetExpiresMs() != 0 && link.GetExpiresMs() <= nowMs) {
+		http.NotFound(w, r)
+		return
+	}
+
+	blob, err := s.records.FetchBlob(r.Context(), link.GetBlobId())
+	if err != nil {
+		zap.L().Error("failed to read Blob", zap.Error(err))
+		http.Error(w, "", http.StatusServiceUnavailable)
+		return
+	}
+	if blob == nil || blob.GetDeleted() {
+		http.NotFound(w, r)
+		return
+	}
+
+	key, err := ParseBlobKey(blob.GetBlobId())
+	if err != nil {
+		// A stored blob_id this pod cannot parse is our bug, not the caller's.
+		zap.L().Error("stored blob_id is not parseable", zap.String("blob_id", blob.GetBlobId()), zap.Error(err))
+		http.Error(w, "", http.StatusInternalServerError)
+		return
+	}
+	f, info, err := s.store.Open(key.Group, key.Namespace, key.Hash)
+	if err != nil {
+		// A record that points at bytes this pod does not hold. Anti-entropy is
+		// what closes this, and it runs at start-up — so this line means a gap
+		// opened since, which is worth an error even though the caller only sees
+		// a 404.
+		zap.L().Error("blob record has no bytes on this pod",
+			zap.String("blob_id", blob.GetBlobId()), zap.Error(err))
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+
+	// The headers the review fixed on (R3, R8), set before ServeContent so a Range
+	// response carries them too.
+	h := w.Header()
+	h.Set("Content-Type", blob.GetContentType())
+	h.Set("Content-Disposition", ContentDisposition(link.GetFilename()))
+	// no-store AND private: no-store keeps it out of the browser's disk cache,
+	// private keeps it out of any shared cache between here and there. A bearer
+	// link is a credential in a URL; a cached copy outlives the revocation.
+	h.Set("Cache-Control", "no-store, private")
+	// The token is IN THE URL, so a referrer header would hand it to whatever the
+	// document links to next.
+	h.Set("Referrer-Policy", "no-referrer")
+	// The content type is asserted by the Blob record and was checked against the
+	// bytes at upload; sniffing could still override it in an old browser.
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Accept-Ranges", "bytes")
+
+	if r.Method == http.MethodHead {
+		// HEAD authorizes and answers headers, and takes NO metric (R3, R10).
+		// ServeContent with a HEAD writes the headers and no body.
+		http.ServeContent(w, r, link.GetFilename(), info.ModTime(), f)
+		return
+	}
+
+	counted := &countingWriter{inner: w}
+	http.ServeContent(responseWriterWith(w, counted), r, link.GetFilename(), info.ModTime(), f)
+	s.stats.Record(link.GetTokenHash(), link.GetOwnerPrincipal(), link.GetNamespace(), counted.written)
+}
+
+// serveUpload receives the bytes for one upload, mirrors them to the peer, and
+// promotes and records them only when both pods have them (R2, R9).
+func (s *Service) serveUpload(w http.ResponseWriter, r *http.Request, token string) {
+	if r.Method != http.MethodPut {
+		w.Header().Set("Allow", "PUT")
+		http.Error(w, "", http.StatusMethodNotAllowed)
+		return
+	}
+	conf := s.conf()
+	if conf == nil {
+		http.Error(w, "", http.StatusServiceUnavailable)
+		return
+	}
+
+	claims, err := conf.signer.VerifyUploadToken(token)
+	if err != nil {
+		// Same 404 as a bad link token, for the same reason.
+		http.NotFound(w, r)
+		return
+	}
+	if claims.ExpiresMs <= s.now().UnixMilli() {
+		http.NotFound(w, r)
+		return
+	}
+	if _, replayed := s.consumed.LoadOrStore(claims.UploadID, struct{}{}); replayed {
+		// Single use (R9 step 3). 409 rather than 404: the caller holds a valid
+		// token and is being told the upload already happened, which is
+		// actionable, and the token's own existence is not a secret from its
+		// holder.
+		http.Error(w, "upload already completed", http.StatusConflict)
+		return
+	}
+
+	vg, err := conf.groups.Lookup(claims.Group)
+	if err != nil {
+		// A signed token for a group that is no longer configured. That is a
+		// deployment state, not a bad token, so it is 503 and a log line rather
+		// than a silent 404 — an operator who removed a group mid-flight needs to
+		// see this.
+		zap.L().Warn("upload token names a group that is not configured",
+			zap.String("group", claims.Group), zap.Error(err))
+		s.consumed.Delete(claims.UploadID)
+		http.Error(w, "", http.StatusServiceUnavailable)
+		return
+	}
+
+	// BOTH PODS OR NEITHER (R2). Asked before a byte of the body is read, so a
+	// doomed upload does not first stream through the gateway.
+	if !s.mirror.Healthy(r.Context()) {
+		zap.L().Warn("refusing upload: peer is not reachable", zap.String("peer", s.mirror.Peer()))
+		s.consumed.Delete(claims.UploadID)
+		http.Error(w, "blob store peer unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	blobID, status, err := s.receiveAndPromote(r, conf, claims, vg.GetMaxBlobBytes())
+	if err != nil {
+		// The reservation goes back and the session settles ABORTED: a failed
+		// upload must not leave a tenant's quota spent (R9 step 3).
+		s.quota.Release(claims.UploadID, claims.Group, claims.Namespace)
+		s.consumed.Delete(claims.UploadID)
+		s.abortSession(r, claims)
+		zap.L().Warn("upload failed", zap.String("upload_id", claims.UploadID), zap.Error(err))
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	s.quota.Commit(claims.UploadID, claims.Group, claims.Namespace)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	// A tiny hand-written JSON object rather than a marshalled struct: it has one
+	// field, and the field is a validated blob id.
+	fmt.Fprintf(w, "{\"blob_id\":%q}\n", blobID)
+}
+
+// receiveAndPromote is the upload's body: tee to the peer and the local temp file,
+// check everything, promote on the peer first and locally second, then publish.
+//
+// THE PROMOTION ORDER IS THE WRITE RULE. The peer renames into place before it
+// answers, so by the time this pod renames, both pods have the bytes fsynced — and
+// the Blob record is published after both, so a record never points at bytes that
+// are not on both pods (R9). The reverse order would make a window where this pod
+// has a promoted file and a published record and the peer has nothing.
+//
+// If the peer promoted and this pod then failed, no record is published and the
+// peer keeps a file nothing points at. That is harmless by construction: the file
+// is named by its own hash, so a retry writes the identical bytes and the peer's
+// copy is a dedup rather than a conflict.
+func (s *Service) receiveAndPromote(
+	r *http.Request,
+	conf *runtimeConfig,
+	claims UploadClaims,
+	maxBlobBytes int64,
+) (blobID string, status int, err error) {
+	tmp, err := s.store.TempFile(claims.UploadID)
+	if err != nil {
+		return "", http.StatusInternalServerError, fmt.Errorf("creating temp file: %w", err)
+	}
+	mirrorW, finishMirror, abortMirror, err := s.mirror.ForwardUpload(r.Context(), r.URL.Path[len(PathUpload):])
+	if err != nil {
+		s.store.DiscardTemp(tmp)
+		return "", http.StatusServiceUnavailable, fmt.Errorf("opening peer stream: %w", err)
+	}
+
+	promoted := false
+	defer func() {
+		if !promoted {
+			s.store.DiscardTemp(tmp)
+		}
+	}()
+
+	size, digest, head, err := receive(io.MultiWriter(tmp, mirrorW), r.Body, maxBlobBytes)
+	if err != nil {
+		abortMirror()
+		if errors.Is(err, ErrTooLarge) {
+			return "", http.StatusRequestEntityTooLarge, err
+		}
+		return "", http.StatusBadRequest, fmt.Errorf("receiving upload: %w", err)
+	}
+	if size != claims.SizeBytes {
+		abortMirror()
+		return "", http.StatusBadRequest, fmt.Errorf("upload is %d bytes, declared %d", size, claims.SizeBytes)
+	}
+	if digest != claims.ContentHash {
+		abortMirror()
+		return "", http.StatusBadRequest, fmt.Errorf("upload hashes to %s, declared %s", digest, claims.ContentHash)
+	}
+	if err := CheckMagicBytes(claims.ContentType, head); err != nil {
+		abortMirror()
+		return "", http.StatusBadRequest, err
+	}
+
+	// The peer runs every one of the checks above on its own copy of the stream,
+	// from the same signed token. This waits for its verdict.
+	if err := finishMirror(); err != nil {
+		return "", http.StatusServiceUnavailable, err
+	}
+
+	if err := s.store.Promote(tmp, claims.Group, claims.Namespace, claims.ContentHash); err != nil {
+		return "", http.StatusInternalServerError, err
+	}
+	promoted = true
+
+	key := BlobKey{Group: claims.Group, Namespace: claims.Namespace, Hash: claims.ContentHash}
+	nowMs := s.now().UnixMilli()
+	blob := &blobstore_pb.Blob{
+		BlobId:         key.String(),
+		Group:          claims.Group,
+		ContentHash:    claims.ContentHash,
+		SizeBytes:      size,
+		ContentType:    claims.ContentType,
+		CreatedMs:      nowMs,
+		OwnerPrincipal: claims.OwnerPrincipal,
+		Namespace:      claims.Namespace,
+	}
+	if err := s.records.PublishBlob(r.Context(), blob); err != nil {
+		// The bytes are on both pods and the record is not. Fail the upload: the
+		// caller must not believe it has a blob it cannot find. The bytes stay,
+		// and a retry of the same content promotes to the same path and publishes
+		// again.
+		return "", http.StatusServiceUnavailable, err
+	}
+
+	session, err := s.records.FetchSession(r.Context(), claims.UploadID)
+	if err != nil || session == nil {
+		// The Blob row is written, which is what the caller needs. A session row
+		// that could not be settled is an audit-trail gap and the expiry sweep
+		// will settle it, so it is logged rather than failing a successful upload.
+		zap.L().Warn("could not read the upload session to settle it",
+			zap.String("upload_id", claims.UploadID), zap.Error(err))
+		return blob.GetBlobId(), http.StatusCreated, nil
+	}
+	if err := s.settleSession(r.Context(), session, blobstore_pb.UploadState_UPLOAD_STATE_COMMITTED); err != nil {
+		zap.L().Warn("could not settle the committed upload session",
+			zap.String("upload_id", claims.UploadID), zap.Error(err))
+	}
+	return blob.GetBlobId(), http.StatusCreated, nil
+}
+
+// abortSession settles a failed upload's session, best effort: the reservation is
+// already released in memory, and the expiry sweep settles the row if this does
+// not.
+func (s *Service) abortSession(r *http.Request, claims UploadClaims) {
+	session, err := s.records.FetchSession(r.Context(), claims.UploadID)
+	if err != nil || session == nil {
+		return
+	}
+	if session.GetState() != blobstore_pb.UploadState_UPLOAD_STATE_PENDING {
+		return
+	}
+	if err := s.settleSession(r.Context(), session, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
+		zap.L().Warn("could not settle the aborted upload session",
+			zap.String("upload_id", claims.UploadID), zap.Error(err))
+	}
+}
+
+// uploadTTL is the token lifetime from config.
+func (c *runtimeConfig) uploadExpiry(now time.Time) int64 {
+	return now.Add(c.uploadTTL).UnixMilli()
+}

@@ -1,0 +1,26 @@
+# Binary
+/genesis
+bin/
+*.exe
+*.dylib
+*.so
+*.test
+*.out
+model/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Windows
+Thumbs.db
+
+# Claude Code
+.claude/
+proto
