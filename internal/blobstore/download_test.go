@@ -12,8 +12,8 @@ import (
 
 func TestDownloadServesTheBytesWithTheRequiredHeaders(t *testing.T) {
 	p := newPair(t)
-	claims := p.uploadOne(t)
-	token := p.mintLinkNamed(t, claims, "quarterly report.pdf")
+	sess := p.uploadOne(t)
+	token := p.mintLinkNamed(t, sess, "quarterly report.pdf")
 
 	resp := p.get(t, p.aBytes, token)
 	defer resp.Body.Close()
@@ -50,19 +50,19 @@ func TestDownloadServesTheBytesWithTheRequiredHeaders(t *testing.T) {
 // blob this pod does not hold. One answer for all of them.
 func TestEveryRefusalOnTheDownloadPathIsTheSame404(t *testing.T) {
 	p := newPair(t)
-	claims := p.uploadOne(t)
+	sess := p.uploadOne(t)
 
-	unknown := p.mintLinkNamed(t, claims, "x.pdf")
+	unknown := p.mintLinkNamed(t, sess, "x.pdf")
 	delete(p.records.links, LinkTokenHash(unknown)) // never existed
 
-	revoked := p.mintLinkNamed(t, claims, "x.pdf")
+	revoked := p.mintLinkNamed(t, sess, "x.pdf")
 	p.records.links[LinkTokenHash(revoked)].RevokedMs = p.nowMs - 1
 
-	expired := p.mintLinkNamed(t, claims, "x.pdf")
+	expired := p.mintLinkNamed(t, sess, "x.pdf")
 	p.records.links[LinkTokenHash(expired)].ExpiresMs = p.nowMs - 1
 
-	deletedBlob := p.mintLinkNamed(t, claims, "x.pdf")
-	p.records.blobs[blobIDOf(claims)].Deleted = true
+	deletedBlob := p.mintLinkNamed(t, sess, "x.pdf")
+	p.records.blobs[blobIDOf(sess)].Deleted = true
 
 	garbage := base64.RawURLEncoding.EncodeToString([]byte("not a token at all!!"))
 
@@ -89,8 +89,8 @@ func TestEveryRefusalOnTheDownloadPathIsTheSame404(t *testing.T) {
 // "HEAD authorizes and answers headers, no metric."
 func TestHeadAnswersHeadersAndTakesNoMetric(t *testing.T) {
 	p := newPair(t)
-	claims := p.uploadOne(t)
-	token := p.mintLinkNamed(t, claims, "x.pdf")
+	sess := p.uploadOne(t)
+	token := p.mintLinkNamed(t, sess, "x.pdf")
 
 	resp := p.do(t, http.MethodHead, p.aBytes, token, nil)
 	body, _ := io.ReadAll(resp.Body)
@@ -118,8 +118,8 @@ func TestHeadAnswersHeadersAndTakesNoMetric(t *testing.T) {
 // "other methods 405."
 func TestOtherMethodsOnTheDownloadPathAre405(t *testing.T) {
 	p := newPair(t)
-	claims := p.uploadOne(t)
-	token := p.mintLinkNamed(t, claims, "x.pdf")
+	sess := p.uploadOne(t)
+	token := p.mintLinkNamed(t, sess, "x.pdf")
 
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
 		resp := p.do(t, method, p.aBytes, token, nil)
@@ -137,8 +137,8 @@ func TestOtherMethodsOnTheDownloadPathAre405(t *testing.T) {
 // RANGE, not the file.
 func TestRangeRequestsAreServedAndCountedByWhatWentOut(t *testing.T) {
 	p := newPair(t)
-	claims := p.uploadOne(t)
-	token := p.mintLinkNamed(t, claims, "x.pdf")
+	sess := p.uploadOne(t)
+	token := p.mintLinkNamed(t, sess, "x.pdf")
 
 	resp := p.do(t, http.MethodGet, p.aBytes, token, http.Header{"Range": {"bytes=0-7"}})
 	body, _ := io.ReadAll(resp.Body)
@@ -158,8 +158,8 @@ func TestRangeRequestsAreServedAndCountedByWhatWentOut(t *testing.T) {
 // unrecallable signed URL (R7).
 func TestRevocationTakesEffectOnTheNextRequest(t *testing.T) {
 	p := newPair(t)
-	claims := p.uploadOne(t)
-	token := p.mintLinkNamed(t, claims, "x.pdf")
+	sess := p.uploadOne(t)
+	token := p.mintLinkNamed(t, sess, "x.pdf")
 
 	first := p.get(t, p.aBytes, token)
 	first.Body.Close()
@@ -180,8 +180,8 @@ func TestRevocationTakesEffectOnTheNextRequest(t *testing.T) {
 // and a 404 would mean "your link is gone" to a client that should retry.
 func TestStratumUnreachableIs503NotNotFound(t *testing.T) {
 	p := newPair(t)
-	claims := p.uploadOne(t)
-	token := p.mintLinkNamed(t, claims, "x.pdf")
+	sess := p.uploadOne(t)
+	token := p.mintLinkNamed(t, sess, "x.pdf")
 
 	p.records.failReads = true
 	resp := p.get(t, p.aBytes, token)

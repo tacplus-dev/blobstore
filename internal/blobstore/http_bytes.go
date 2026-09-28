@@ -146,34 +146,63 @@ func (s *Service) serveUpload(w http.ResponseWriter, r *http.Request, token stri
 		return
 	}
 
-	claims, err := conf.signer.VerifyUploadToken(token)
+	if token == "" || strings.Contains(token, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	// VERIFICATION IS A LOOKUP (R3, R9). The token is raw randomness; the row it
+	// hashes to is the grant, and the row's fields are the upload's terms. There
+	// is no signature and no key.
+	session, err := s.records.FetchSession(r.Context(), UploadTokenHash(token))
 	if err != nil {
-		// Same 404 as a bad link token, for the same reason.
+		// A stratum this pod cannot read is information about US, not about the
+		// token — 503, same as serveBlob (R11).
+		http.Error(w, "", http.StatusServiceUnavailable)
+		return
+	}
+	if session == nil {
+		// Unknown, cancelled-and-purged, swept: one 404, same as a bad link
+		// token and for the same oracle reason.
 		http.NotFound(w, r)
 		return
 	}
-	if claims.ExpiresMs <= s.now().UnixMilli() {
+	if session.GetExpiresMs() <= s.now().UnixMilli() {
 		http.NotFound(w, r)
 		return
 	}
-	if _, replayed := s.consumed.LoadOrStore(claims.UploadID, struct{}{}); replayed {
-		// Single use (R9 step 3). 409 rather than 404: the caller holds a valid
-		// token and is being told the upload already happened, which is
-		// actionable, and the token's own existence is not a secret from its
-		// holder.
+	if session.GetState() != blobstore_pb.UploadState_UPLOAD_STATE_PENDING {
+		// Single use, durably (R9 step 3): the row leaves PENDING when the upload
+		// settles. 409 rather than 404 — the caller holds a real token and is
+		// being told the upload already happened, which is actionable, and the
+		// token's own existence is not a secret from its holder.
+		http.Error(w, "upload already completed", http.StatusConflict)
+		return
+	}
+	// The row was written by this service and validated at CreateUpload. It is
+	// re-checked here anyway because what comes next builds a filesystem path out
+	// of it, and the cost of being wrong about that is a path traversal.
+	if err := validateBlobKey(session.GetGroup(), session.GetNamespace(), session.GetContentHash()); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	uploadID := session.GetUploadId()
+	if _, replayed := s.consumed.LoadOrStore(uploadID, struct{}{}); replayed {
+		// The in-flight half of single use: the row above is still PENDING while
+		// the first transfer streams.
 		http.Error(w, "upload already completed", http.StatusConflict)
 		return
 	}
 
-	vg, err := conf.groups.Lookup(claims.Group)
+	vg, err := conf.groups.Lookup(session.GetGroup())
 	if err != nil {
-		// A signed token for a group that is no longer configured. That is a
+		// A live session for a group that is no longer configured. That is a
 		// deployment state, not a bad token, so it is 503 and a log line rather
 		// than a silent 404 — an operator who removed a group mid-flight needs to
 		// see this.
-		zap.L().Warn("upload token names a group that is not configured",
-			zap.String("group", claims.Group), zap.Error(err))
-		s.consumed.Delete(claims.UploadID)
+		zap.L().Warn("upload session names a group that is not configured",
+			zap.String("group", session.GetGroup()), zap.Error(err))
+		s.consumed.Delete(uploadID)
 		http.Error(w, "", http.StatusServiceUnavailable)
 		return
 	}
@@ -182,24 +211,24 @@ func (s *Service) serveUpload(w http.ResponseWriter, r *http.Request, token stri
 	// doomed upload does not first stream through the gateway.
 	if !s.mirror.Healthy(r.Context()) {
 		zap.L().Warn("refusing upload: peer is not reachable", zap.String("peer", s.mirror.Peer()))
-		s.consumed.Delete(claims.UploadID)
+		s.consumed.Delete(uploadID)
 		http.Error(w, "blob store peer unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	blobID, status, err := s.receiveAndPromote(r, conf, claims, vg.GetMaxBlobBytes())
+	blobID, status, err := s.receiveAndPromote(r, session, vg.GetMaxBlobBytes())
 	if err != nil {
 		// The reservation goes back and the session settles ABORTED: a failed
 		// upload must not leave a tenant's quota spent (R9 step 3).
-		s.quota.Release(claims.UploadID, claims.Group, claims.Namespace)
-		s.consumed.Delete(claims.UploadID)
-		s.abortSession(r, claims)
-		zap.L().Warn("upload failed", zap.String("upload_id", claims.UploadID), zap.Error(err))
+		s.quota.Release(uploadID, session.GetGroup(), session.GetNamespace())
+		s.consumed.Delete(uploadID)
+		s.abortSession(r, session)
+		zap.L().Warn("upload failed", zap.String("upload_id", uploadID), zap.Error(err))
 		http.Error(w, err.Error(), status)
 		return
 	}
 
-	s.quota.Commit(claims.UploadID, claims.Group, claims.Namespace)
+	s.quota.Commit(uploadID, session.GetGroup(), session.GetNamespace())
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	// A tiny hand-written JSON object rather than a marshalled struct: it has one
@@ -222,11 +251,10 @@ func (s *Service) serveUpload(w http.ResponseWriter, r *http.Request, token stri
 // copy is a dedup rather than a conflict.
 func (s *Service) receiveAndPromote(
 	r *http.Request,
-	conf *runtimeConfig,
-	claims UploadClaims,
+	session *blobstore_pb.UploadSession,
 	maxBlobBytes int64,
 ) (blobID string, status int, err error) {
-	tmp, err := s.store.TempFile(claims.UploadID)
+	tmp, err := s.store.TempFile(session.GetUploadId())
 	if err != nil {
 		return "", http.StatusInternalServerError, fmt.Errorf("creating temp file: %w", err)
 	}
@@ -251,41 +279,41 @@ func (s *Service) receiveAndPromote(
 		}
 		return "", http.StatusBadRequest, fmt.Errorf("receiving upload: %w", err)
 	}
-	if size != claims.SizeBytes {
+	if size != session.GetSizeBytes() {
 		abortMirror()
-		return "", http.StatusBadRequest, fmt.Errorf("upload is %d bytes, declared %d", size, claims.SizeBytes)
+		return "", http.StatusBadRequest, fmt.Errorf("upload is %d bytes, declared %d", size, session.GetSizeBytes())
 	}
-	if digest != claims.ContentHash {
+	if digest != session.GetContentHash() {
 		abortMirror()
-		return "", http.StatusBadRequest, fmt.Errorf("upload hashes to %s, declared %s", digest, claims.ContentHash)
+		return "", http.StatusBadRequest, fmt.Errorf("upload hashes to %s, declared %s", digest, session.GetContentHash())
 	}
-	if err := CheckMagicBytes(claims.ContentType, head); err != nil {
+	if err := CheckMagicBytes(session.GetContentType(), head); err != nil {
 		abortMirror()
 		return "", http.StatusBadRequest, err
 	}
 
 	// The peer runs every one of the checks above on its own copy of the stream,
-	// from the same signed token. This waits for its verdict.
+	// reading the same session row this pod read. This waits for its verdict.
 	if err := finishMirror(); err != nil {
 		return "", http.StatusServiceUnavailable, err
 	}
 
-	if err := s.store.Promote(tmp, claims.Group, claims.Namespace, claims.ContentHash); err != nil {
+	if err := s.store.Promote(tmp, session.GetGroup(), session.GetNamespace(), session.GetContentHash()); err != nil {
 		return "", http.StatusInternalServerError, err
 	}
 	promoted = true
 
-	key := BlobKey{Group: claims.Group, Namespace: claims.Namespace, Hash: claims.ContentHash}
+	key := BlobKey{Group: session.GetGroup(), Namespace: session.GetNamespace(), Hash: session.GetContentHash()}
 	nowMs := s.now().UnixMilli()
 	blob := &blobstore_pb.Blob{
 		BlobId:         key.String(),
-		Group:          claims.Group,
-		ContentHash:    claims.ContentHash,
+		Group:          session.GetGroup(),
+		ContentHash:    session.GetContentHash(),
 		SizeBytes:      size,
-		ContentType:    claims.ContentType,
+		ContentType:    session.GetContentType(),
 		CreatedMs:      nowMs,
-		OwnerPrincipal: claims.OwnerPrincipal,
-		Namespace:      claims.Namespace,
+		OwnerPrincipal: session.GetOwnerPrincipal(),
+		Namespace:      session.GetNamespace(),
 	}
 	if err := s.records.PublishBlob(r.Context(), blob); err != nil {
 		// The bytes are on both pods and the record is not. Fail the upload: the
@@ -295,18 +323,20 @@ func (s *Service) receiveAndPromote(
 		return "", http.StatusServiceUnavailable, err
 	}
 
-	session, err := s.records.FetchSession(r.Context(), claims.UploadID)
-	if err != nil || session == nil {
+	// Re-read rather than settling the row this request started from: the sweep
+	// or a CancelUpload may have moved it while the bytes were in flight.
+	fresh, err := s.records.FetchSession(r.Context(), session.GetUploadId())
+	if err != nil || fresh == nil {
 		// The Blob row is written, which is what the caller needs. A session row
 		// that could not be settled is an audit-trail gap and the expiry sweep
 		// will settle it, so it is logged rather than failing a successful upload.
 		zap.L().Warn("could not read the upload session to settle it",
-			zap.String("upload_id", claims.UploadID), zap.Error(err))
+			zap.String("upload_id", session.GetUploadId()), zap.Error(err))
 		return blob.GetBlobId(), http.StatusCreated, nil
 	}
-	if err := s.settleSession(r.Context(), session, blobstore_pb.UploadState_UPLOAD_STATE_COMMITTED); err != nil {
+	if err := s.settleSession(r.Context(), fresh, blobstore_pb.UploadState_UPLOAD_STATE_COMMITTED); err != nil {
 		zap.L().Warn("could not settle the committed upload session",
-			zap.String("upload_id", claims.UploadID), zap.Error(err))
+			zap.String("upload_id", session.GetUploadId()), zap.Error(err))
 	}
 	return blob.GetBlobId(), http.StatusCreated, nil
 }
@@ -314,17 +344,17 @@ func (s *Service) receiveAndPromote(
 // abortSession settles a failed upload's session, best effort: the reservation is
 // already released in memory, and the expiry sweep settles the row if this does
 // not.
-func (s *Service) abortSession(r *http.Request, claims UploadClaims) {
-	session, err := s.records.FetchSession(r.Context(), claims.UploadID)
-	if err != nil || session == nil {
+func (s *Service) abortSession(r *http.Request, session *blobstore_pb.UploadSession) {
+	fresh, err := s.records.FetchSession(r.Context(), session.GetUploadId())
+	if err != nil || fresh == nil {
 		return
 	}
-	if session.GetState() != blobstore_pb.UploadState_UPLOAD_STATE_PENDING {
+	if fresh.GetState() != blobstore_pb.UploadState_UPLOAD_STATE_PENDING {
 		return
 	}
-	if err := s.settleSession(r.Context(), session, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
+	if err := s.settleSession(r.Context(), fresh, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
 		zap.L().Warn("could not settle the aborted upload session",
-			zap.String("upload_id", claims.UploadID), zap.Error(err))
+			zap.String("upload_id", session.GetUploadId()), zap.Error(err))
 	}
 }
 

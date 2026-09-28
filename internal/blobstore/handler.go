@@ -99,7 +99,9 @@ func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Calle
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
 
-	uploadID, err := NewUploadID()
+	// The token is minted FIRST because its sha256 is the session's key: the row
+	// and the credential are one thing, exactly as CreateLink's are (R3, R9).
+	uploadToken, uploadID, err := MintUploadToken()
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -136,23 +138,9 @@ func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Calle
 	if err := h.svc.records.PublishSession(ctx, session); err != nil {
 		release()
 		// Fail closed on stratum (R11). A token handed out without a durable
-		// session is a reservation nothing can ever release.
+		// session is now worse than a reservation nothing can release: the row IS
+		// the grant, so the token would never be accepted by anything.
 		return nil, status.Error(codes.Unavailable, err.Error())
-	}
-
-	token, err := conf.signer.MintUploadToken(UploadClaims{
-		UploadID:       uploadID,
-		Group:          req.GetGroup(),
-		Namespace:      req.GetNamespace(),
-		ContentHash:    req.GetContentHash(),
-		SizeBytes:      req.GetSizeBytes(),
-		ContentType:    req.GetContentType(),
-		ExpiresMs:      expiresMs,
-		OwnerPrincipal: owner,
-	})
-	if err != nil {
-		release()
-		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	key := BlobKey{Group: req.GetGroup(), Namespace: req.GetNamespace(), Hash: req.GetContentHash()}
@@ -164,8 +152,8 @@ func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Calle
 
 	return &blobstore_pb.CreateUploadResponse{
 		UploadId:    uploadID,
-		UploadToken: token,
-		UploadPath:  PathUpload + token,
+		UploadToken: uploadToken,
+		UploadPath:  PathUpload + uploadToken,
 		ExpiresMs:   expiresMs,
 		// already_present lets a caller skip the transfer entirely — the whole
 		// payoff of declaring the hash up front. The token is still valid, so a

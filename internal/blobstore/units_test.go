@@ -1,82 +1,35 @@
 package blobstore
 
 import (
-	"encoding/base64"
 	"strings"
 	"testing"
 )
 
-// The upload token is the credential that replaces a signed cloud URL (R3), so
-// what it refuses matters as much as what it carries.
-func TestUploadTokenRoundTripsAndRefusesTampering(t *testing.T) {
-	signer, err := NewTokenSigner([]byte("0123456789abcdef0123456789abcdef"))
-	if err != nil {
-		t.Fatalf("NewTokenSigner: %v", err)
-	}
-	want := UploadClaims{
-		UploadID:       "u1",
-		Group:          "documents",
-		Namespace:      "/tenants/acme",
-		ContentHash:    strings.Repeat("a", 64),
-		SizeBytes:      10,
-		ContentType:    "application/pdf",
-		ExpiresMs:      1,
-		OwnerPrincipal: "docmanager",
-	}
-	token, err := signer.MintUploadToken(want)
-	if err != nil {
-		t.Fatalf("MintUploadToken: %v", err)
-	}
-	got, err := signer.VerifyUploadToken(token)
-	if err != nil {
-		t.Fatalf("VerifyUploadToken: %v", err)
-	}
-	if got != want {
-		t.Fatalf("round trip lost claims:\n got %+v\nwant %+v", got, want)
-	}
-
-	// A payload edited in flight: the size the token authorized is raised, which is
-	// exactly what a quota reservation must not be bypassable by.
-	parts := strings.Split(token, ".")
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		t.Fatalf("decoding payload: %v", err)
-	}
-	tampered := strings.Replace(string(raw), `"s":10`, `"s":99`, 1)
-	if tampered == string(raw) {
-		t.Fatal("the payload shape changed; this test is no longer editing the size")
-	}
-	forged := parts[0] + "." + base64.RawURLEncoding.EncodeToString([]byte(tampered)) + "." + parts[2]
-	if _, err := signer.VerifyUploadToken(forged); err == nil {
-		t.Fatal("a token with an edited payload was accepted")
-	}
-
-	// A token signed with another key.
-	other, err := NewTokenSigner([]byte("fedcba9876543210fedcba9876543210"))
-	if err != nil {
-		t.Fatalf("NewTokenSigner: %v", err)
-	}
-	if _, err := other.VerifyUploadToken(token); err == nil {
-		t.Fatal("a token signed with a different key was accepted")
-	}
-
-	// A signed token whose claims name a path: the signature is authentic and the
-	// contents still have to be refused.
-	traversal, err := signer.MintUploadToken(UploadClaims{
-		UploadID: "u2", Group: "../..", Namespace: "/tenants/acme",
-		ContentHash: strings.Repeat("a", 64), SizeBytes: 1, ContentType: "text/plain", ExpiresMs: 1,
-	})
-	if err != nil {
-		t.Fatalf("MintUploadToken: %v", err)
-	}
-	if _, err := signer.VerifyUploadToken(traversal); err == nil {
-		t.Fatal("a signed token naming a traversal group was accepted")
-	}
-}
-
-func TestTokenSignerRefusesAShortKey(t *testing.T) {
-	if _, err := NewTokenSigner([]byte("too short")); err == nil {
-		t.Fatal("a 9-byte HMAC key was accepted")
+// The upload token is the credential that replaces a signed cloud URL (R3), and
+// it is raw entropy whose sha256 keys the UploadSession row — the same
+// construction as a link token, with no signature and no key (corrected
+// 2026-09-27: the HMAC envelope is gone).
+func TestUploadTokenIsRandomAndKeyedByItsHash(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 64; i++ {
+		token, hash, err := MintUploadToken()
+		if err != nil {
+			t.Fatalf("MintUploadToken: %v", err)
+		}
+		if seen[token] {
+			t.Fatal("MintUploadToken repeated a token")
+		}
+		seen[token] = true
+		// 32 raw bytes is 43 base64url characters — the doc's ">= 256 random bits".
+		if len(token) != 43 {
+			t.Fatalf("token is %d characters, want 43 (256 bits, base64url)", len(token))
+		}
+		if hash != UploadTokenHash(token) {
+			t.Fatal("the mint's hash and the PUT path's hash disagree")
+		}
+		if strings.Contains(hash, token) {
+			t.Fatal("the stored hash contains the raw token")
+		}
 	}
 }
 

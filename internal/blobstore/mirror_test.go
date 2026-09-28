@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	blobstore_pb "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/types/services/blobstore"
 )
 
 // Every test in this file is one line of the decision doc's Tests list, in its
@@ -29,7 +31,7 @@ func TestUploadRefusedWhenPeerIsDownAndReadsStillServed(t *testing.T) {
 
 	// First, a successful upload while both pods are up — the read has to have
 	// something to serve.
-	token, claims := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
+	token, sess := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
 	if got := put(t, p.aBytes, token, pdfBody); got != http.StatusCreated {
 		t.Fatalf("upload with both pods up: got %d, want 201", got)
 	}
@@ -45,7 +47,7 @@ func TestUploadRefusedWhenPeerIsDownAndReadsStillServed(t *testing.T) {
 	}
 
 	// And the read still works, from the pod that is up.
-	linkToken := p.mintLink(t, claims)
+	linkToken := p.mintLink(t, sess)
 	resp := p.get(t, p.aBytes, linkToken)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -59,7 +61,7 @@ func TestUploadRefusedWhenPeerIsDownAndReadsStillServed(t *testing.T) {
 // must fail AND neither pod may be left holding a temp file or a promoted file.
 func TestHashMismatchLeavesNothingOnEitherPod(t *testing.T) {
 	p := newPair(t)
-	token, claims := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
+	token, sess := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
 
 	// Same length, different content: the size check passes and the hash check is
 	// what has to catch it.
@@ -70,12 +72,12 @@ func TestHashMismatchLeavesNothingOnEitherPod(t *testing.T) {
 	}
 
 	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		if svc.store.Has(claims.Group, claims.Namespace, claims.ContentHash) {
+		if svc.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
 			t.Errorf("pod %s promoted a blob whose hash did not match", name)
 		}
 		assertNoTemps(t, name, svc)
 	}
-	if _, ok := p.records.blobs[blobIDOf(claims)]; ok {
+	if _, ok := p.records.blobs[blobIDOf(sess)]; ok {
 		t.Error("a Blob record was published for a failed upload")
 	}
 }
@@ -87,12 +89,12 @@ func TestMagicByteMismatchIsRefused(t *testing.T) {
 	// allow-list and the hash and size are correct, so magic bytes are the only
 	// thing that can refuse it.
 	elf := []byte{0x7F, 'E', 'L', 'F', 1, 1, 1, 0, 0, 0}
-	token, claims := p.mintUpload(t, p.a, testNS, "application/pdf", elf)
+	token, sess := p.mintUpload(t, p.a, testNS, "application/pdf", elf)
 	if got := put(t, p.aBytes, token, elf); got != http.StatusBadRequest {
 		t.Fatalf("magic-byte mismatch: got %d, want 400", got)
 	}
 	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		if svc.store.Has(claims.Group, claims.Namespace, claims.ContentHash) {
+		if svc.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
 			t.Errorf("pod %s promoted a blob that failed the magic-byte check", name)
 		}
 		assertNoTemps(t, name, svc)
@@ -106,14 +108,14 @@ func TestUploadPastMaxBlobBytesIsRefusedOnTheWire(t *testing.T) {
 	// The token declares 10 bytes; the group's ceiling is 1024; the body is 2048.
 	// Nothing but the wire check can catch this.
 	small := []byte("%PDF-1.7\n\n")
-	token, claims := p.mintUpload(t, p.a, testNS, "application/pdf", small)
+	token, sess := p.mintUpload(t, p.a, testNS, "application/pdf", small)
 	big := append([]byte("%PDF-1.7\n"), make([]byte, 2048)...)
 
 	if got := put(t, p.aBytes, token, big); got != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized upload: got %d, want 413", got)
 	}
 	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		if svc.store.Has(claims.Group, claims.Namespace, claims.ContentHash) {
+		if svc.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
 			t.Errorf("pod %s promoted an oversized blob", name)
 		}
 		assertNoTemps(t, name, svc)
@@ -141,21 +143,21 @@ func TestDedupIsPerTenant(t *testing.T) {
 	p := newPair(t)
 	const otherNS = "/tenants/other"
 
-	tokenA, claimsA := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
+	tokenA, sessA := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
 	if got := put(t, p.aBytes, tokenA, pdfBody); got != http.StatusCreated {
 		t.Fatalf("first tenant's upload: got %d, want 201", got)
 	}
-	tokenB, claimsB := p.mintUpload(t, p.a, otherNS, "application/pdf", pdfBody)
+	tokenB, sessB := p.mintUpload(t, p.a, otherNS, "application/pdf", pdfBody)
 	if got := put(t, p.aBytes, tokenB, pdfBody); got != http.StatusCreated {
 		t.Fatalf("second tenant's upload: got %d, want 201", got)
 	}
 
-	if claimsA.ContentHash != claimsB.ContentHash {
+	if sessA.GetContentHash() != sessB.GetContentHash() {
 		t.Fatal("the two uploads must be the same bytes for this test to mean anything")
 	}
 	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		pathA := svc.store.Path(testGroup, testNS, claimsA.ContentHash)
-		pathB := svc.store.Path(testGroup, otherNS, claimsB.ContentHash)
+		pathA := svc.store.Path(testGroup, testNS, sessA.GetContentHash())
+		pathB := svc.store.Path(testGroup, otherNS, sessB.GetContentHash())
 		if pathA == pathB {
 			t.Fatalf("pod %s: two tenants share one path %s", name, pathA)
 		}
@@ -185,24 +187,24 @@ func TestUploadTokenIsSingleUse(t *testing.T) {
 // "anti-entropy rebuilds an empty PVC before serving."
 func TestAntiEntropyFillsAnEmptyPVCFromThePeer(t *testing.T) {
 	p := newPair(t)
-	token, claims := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
+	token, sess := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
 	if got := put(t, p.aBytes, token, pdfBody); got != http.StatusCreated {
 		t.Fatalf("upload: got %d, want 201", got)
 	}
 
 	// Pod A's disk is replaced: a fresh, empty PVC at a new path, same peer.
 	replaced := p.newPod(t, "pod-a", hostOf(t, p.aPeer.URL), hostOf(t, p.bPeer.URL))
-	if replaced.store.Has(claims.Group, claims.Namespace, claims.ContentHash) {
+	if replaced.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
 		t.Fatal("a fresh PVC must start empty")
 	}
 
 	replaced.SyncOnStart(context.Background())
 
-	if !replaced.store.Has(claims.Group, claims.Namespace, claims.ContentHash) {
+	if !replaced.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
 		t.Fatal("anti-entropy did not copy the blob the peer holds")
 	}
 	// And the copy is the real bytes, not an empty file named after a hash.
-	got, err := os.ReadFile(replaced.store.Path(claims.Group, claims.Namespace, claims.ContentHash))
+	got, err := os.ReadFile(replaced.store.Path(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()))
 	if err != nil {
 		t.Fatalf("reading the copied blob: %v", err)
 	}
@@ -230,11 +232,11 @@ func TestAntiEntropyRefusesBytesThatDoNotHashToTheirName(t *testing.T) {
 // dedup, and the file that is there stays there.
 func TestPromoteIsDedupAndNeverOverwrites(t *testing.T) {
 	p := newPair(t)
-	token, claims := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
+	token, sess := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
 	if got := put(t, p.aBytes, token, pdfBody); got != http.StatusCreated {
 		t.Fatalf("first upload: got %d, want 201", got)
 	}
-	path := p.a.store.Path(claims.Group, claims.Namespace, claims.ContentHash)
+	path := p.a.store.Path(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash())
 	first, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
@@ -289,6 +291,6 @@ func assertNoTemps(t *testing.T, pod string, svc *Service) {
 	}
 }
 
-func blobIDOf(c UploadClaims) string {
-	return BlobKey{Group: c.Group, Namespace: c.Namespace, Hash: c.ContentHash}.String()
+func blobIDOf(sess *blobstore_pb.UploadSession) string {
+	return BlobKey{Group: sess.GetGroup(), Namespace: sess.GetNamespace(), Hash: sess.GetContentHash()}.String()
 }

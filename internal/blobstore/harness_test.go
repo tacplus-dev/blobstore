@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -30,23 +29,15 @@ import (
 
 const testGroup = "documents"
 
-// testHMACKey is 32 bytes of nothing in particular. It is a test key and is used
-// nowhere else.
-var testHMACKey = base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
-
 // pair is two pods that mirror to each other.
 type pair struct {
-	a, b    *Service
-	aBytes  *httptest.Server
-	bBytes  *httptest.Server
-	aPeer   *httptest.Server
-	bPeer   *httptest.Server
-	records *fakeRecords
-	nowMs   int64
-	// uploads counts mints, so every token in a test has its own upload id — the
-	// single-use ledger is keyed by it, and reusing one would fail a later mint
-	// as a replay.
-	uploads    int
+	a, b       *Service
+	aBytes     *httptest.Server
+	bBytes     *httptest.Server
+	aPeer      *httptest.Server
+	bPeer      *httptest.Server
+	records    *fakeRecords
+	nowMs      int64
 	aPeerRoute *routableHandler
 	bPeerRoute *routableHandler
 }
@@ -147,7 +138,6 @@ func testConfig() *blobstore_pb.Config {
 			ContentTypes:     []string{"application/pdf", "text/plain"},
 			TenantQuotaBytes: 4096,
 		}},
-		TokenHmacKey:                testHMACKey,
 		UploadTokenTtlSeconds:       900,
 		StatsFlushIntervalSeconds:   60,
 		SessionSweepIntervalSeconds: 60,
@@ -155,39 +145,33 @@ func testConfig() *blobstore_pb.Config {
 }
 
 // mintUpload produces a live upload token for `body`, the way CreateUpload would,
-// and records the session. The RPC path is exercised separately; this keeps the
-// byte-path tests about bytes.
-func (p *pair) mintUpload(t *testing.T, svc *Service, namespace, contentType string, body []byte) (string, UploadClaims) {
+// and records the session it resolves to. The RPC path is exercised separately;
+// this keeps the byte-path tests about bytes.
+//
+// The token and the row are one thing now: the row's key IS the token's sha256,
+// so there is nothing to keep in step by hand.
+func (p *pair) mintUpload(t *testing.T, _ *Service, namespace, contentType string, body []byte) (string, *blobstore_pb.UploadSession) {
 	t.Helper()
 	sum := sha256.Sum256(body)
-	p.uploads++
-	claims := UploadClaims{
-		UploadID:       fmt.Sprintf("upload-%d", p.uploads),
-		Group:          testGroup,
-		Namespace:      namespace,
-		ContentHash:    hex.EncodeToString(sum[:]),
-		SizeBytes:      int64(len(body)),
-		ContentType:    contentType,
-		ExpiresMs:      p.nowMs + 60_000,
-		OwnerPrincipal: "docmanager",
-	}
-	token, err := svc.conf().signer.MintUploadToken(claims)
+	token, uploadID, err := MintUploadToken()
 	if err != nil {
 		t.Fatalf("MintUploadToken: %v", err)
 	}
-	p.records.putSession(&blobstore_pb.UploadSession{
-		UploadId:       claims.UploadID,
-		Group:          claims.Group,
-		ContentHash:    claims.ContentHash,
-		SizeBytes:      claims.SizeBytes,
-		ContentType:    claims.ContentType,
-		ReservedBytes:  claims.SizeBytes,
+	sess := &blobstore_pb.UploadSession{
+		UploadId:       uploadID,
+		Group:          testGroup,
+		ContentHash:    hex.EncodeToString(sum[:]),
+		SizeBytes:      int64(len(body)),
+		ContentType:    contentType,
+		ReservedBytes:  int64(len(body)),
 		State:          blobstore_pb.UploadState_UPLOAD_STATE_PENDING,
-		ExpiresMs:      claims.ExpiresMs,
-		OwnerPrincipal: claims.OwnerPrincipal,
-		Namespace:      claims.Namespace,
-	})
-	return token, claims
+		CreatedMs:      p.nowMs,
+		ExpiresMs:      p.nowMs + 60_000,
+		OwnerPrincipal: "docmanager",
+		Namespace:      namespace,
+	}
+	p.records.putSession(sess)
+	return token, sess
 }
 
 // put streams a body to one pod's public upload path and returns the status code.
@@ -370,12 +354,12 @@ func (f *fakeRecords) PublishLinkStats(_ context.Context, rec *blobstore_pb.Blob
 // mintLink records a live BEARER link for a blob and returns the raw token, the
 // way CreateLink would. The RPC path is tested separately; this keeps the
 // download tests about the download.
-func (p *pair) mintLink(t *testing.T, claims UploadClaims) string {
+func (p *pair) mintLink(t *testing.T, sess *blobstore_pb.UploadSession) string {
 	t.Helper()
-	return p.mintLinkNamed(t, claims, "report.pdf")
+	return p.mintLinkNamed(t, sess, "report.pdf")
 }
 
-func (p *pair) mintLinkNamed(t *testing.T, claims UploadClaims, filename string) string {
+func (p *pair) mintLinkNamed(t *testing.T, sess *blobstore_pb.UploadSession, filename string) string {
 	t.Helper()
 	token, tokenHash, err := MintLinkToken()
 	if err != nil {
@@ -383,12 +367,12 @@ func (p *pair) mintLinkNamed(t *testing.T, claims UploadClaims, filename string)
 	}
 	p.records.links[tokenHash] = &blobstore_pb.BlobLink{
 		TokenHash:      tokenHash,
-		BlobId:         BlobKey{Group: claims.Group, Namespace: claims.Namespace, Hash: claims.ContentHash}.String(),
+		BlobId:         BlobKey{Group: sess.GetGroup(), Namespace: sess.GetNamespace(), Hash: sess.GetContentHash()}.String(),
 		Filename:       filename,
 		Policy:         blobstore_pb.LinkPolicy_LINK_POLICY_BEARER,
 		CreatedMs:      p.nowMs,
-		OwnerPrincipal: claims.OwnerPrincipal,
-		Namespace:      claims.Namespace,
+		OwnerPrincipal: sess.GetOwnerPrincipal(),
+		Namespace:      sess.GetNamespace(),
 	}
 	return token
 }
@@ -421,12 +405,12 @@ func (p *pair) do(t *testing.T, method string, srv *httptest.Server, token strin
 func bytesOf(s string) *bytes.Reader { return bytes.NewReader([]byte(s)) }
 
 // uploadOne runs one successful upload through the public path and returns its
-// claims, for the tests that need a blob to exist before they start.
-func (p *pair) uploadOne(t *testing.T) UploadClaims {
+// session, for the tests that need a blob to exist before they start.
+func (p *pair) uploadOne(t *testing.T) *blobstore_pb.UploadSession {
 	t.Helper()
-	token, claims := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
+	token, sess := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
 	if got := put(t, p.aBytes, token, pdfBody); got != http.StatusCreated {
 		t.Fatalf("setup upload: got %d, want 201", got)
 	}
-	return claims
+	return sess
 }

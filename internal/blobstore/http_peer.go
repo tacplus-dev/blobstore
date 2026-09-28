@@ -111,9 +111,24 @@ func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 
-	// The same signature check the public path makes. The hop is not trusted.
-	claims, err := conf.signer.VerifyUploadToken(token)
+	// The same lookup the public path makes, against the same row. The hop is not
+	// trusted: this pod resolves the token itself rather than believing terms
+	// another pod sent it. The cost is one stratum read per mirrored upload —
+	// which is new, and is what the old self-describing token bought.
+	if token == "" || strings.Contains(token, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	session, err := s.records.FetchSession(r.Context(), UploadTokenHash(token))
 	if err != nil {
+		http.Error(w, "", http.StatusServiceUnavailable)
+		return
+	}
+	if session == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := validateBlobKey(session.GetGroup(), session.GetNamespace(), session.GetContentHash()); err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -121,14 +136,16 @@ func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, token 
 	// checked it when the client's request arrived, and a large upload can
 	// legitimately still be streaming after the token's expiry — failing it at
 	// minute 16 having transferred everything is the behaviour UploadSession's own
-	// comment rules out.
-	vg, err := conf.groups.Lookup(claims.Group)
+	// comment rules out. The row's STATE is not checked either: it is still
+	// PENDING for the whole of the legitimate hop, so a check here would only
+	// duplicate the public path's, which has already run.
+	vg, err := conf.groups.Lookup(session.GetGroup())
 	if err != nil {
 		http.Error(w, "", http.StatusServiceUnavailable)
 		return
 	}
 
-	tmp, err := s.store.TempFile(claims.UploadID)
+	tmp, err := s.store.TempFile(session.GetUploadId())
 	if err != nil {
 		zap.L().Error("failed to create a temp file for a mirrored upload", zap.Error(err))
 		http.Error(w, "", http.StatusInternalServerError)
@@ -147,14 +164,14 @@ func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, token 
 		zap.L().Warn("mirrored upload failed while receiving", zap.Error(err))
 		http.Error(w, "", http.StatusBadRequest)
 		return
-	case size != claims.SizeBytes:
+	case size != session.GetSizeBytes():
 		http.Error(w, "", http.StatusBadRequest)
 		return
-	case digest != claims.ContentHash:
+	case digest != session.GetContentHash():
 		http.Error(w, "", http.StatusBadRequest)
 		return
 	}
-	if err := CheckMagicBytes(claims.ContentType, head); err != nil {
+	if err := CheckMagicBytes(session.GetContentType(), head); err != nil {
 		http.Error(w, "", http.StatusBadRequest)
 		return
 	}
@@ -162,7 +179,7 @@ func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, token 
 	// Promote BEFORE answering: the answer is what tells the other pod the bytes
 	// are fsynced and in place here, and that is what it waits for before
 	// promoting its own copy (R9 step 3).
-	if err := s.store.Promote(tmp, claims.Group, claims.Namespace, claims.ContentHash); err != nil {
+	if err := s.store.Promote(tmp, session.GetGroup(), session.GetNamespace(), session.GetContentHash()); err != nil {
 		zap.L().Error("failed to promote a mirrored upload", zap.Error(err))
 		http.Error(w, "", http.StatusInternalServerError)
 		return

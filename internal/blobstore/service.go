@@ -2,8 +2,6 @@ package blobstore
 
 import (
 	"context"
-	"encoding/base64"
-	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -37,20 +35,20 @@ type Service struct {
 	// it, so a reader must never be able to see half of an update.
 	cfg atomic.Pointer[runtimeConfig]
 
-	// consumed is the single-use ledger for upload tokens (R9 step 3). It is
-	// per-pod and in memory, and that is enough: the token binds the content hash,
-	// so replaying one can only rewrite the same content-addressed file, which is
-	// a dedup. What this catches is the accidental double-PUT — a client retrying
-	// a request that actually succeeded — which deserves a clear answer rather
-	// than a second full transfer.
-	consumed sync.Map // upload id -> struct{}
+	// consumed is the IN-FLIGHT half of the single-use ledger for upload tokens
+	// (R9 step 3). The durable half is the UploadSession row's own state, which
+	// leaves PENDING when the upload settles — but it settles only at the END of
+	// a transfer, so a second PUT arriving while the first is still streaming
+	// would find the row PENDING. This map is what closes that window, and it is
+	// per-pod and in memory because the window it covers is one pod's in-flight
+	// request.
+	consumed sync.Map // upload id (the token's sha256) -> struct{}
 }
 
 // runtimeConfig is the part of Config this service reads per request, resolved
 // once per delivery so a request never parses config.
 type runtimeConfig struct {
 	groups       *Groups
-	signer       *TokenSigner
 	uploadTTL    time.Duration
 	statsFlush   time.Duration
 	sessionSweep time.Duration
@@ -87,22 +85,8 @@ func (s *Service) Configure(cfg *blobstore_pb.Config) error {
 	if err != nil {
 		return err
 	}
-	key, err := base64.StdEncoding.DecodeString(cfg.GetTokenHmacKey())
-	if err != nil {
-		// RawURLEncoding too: the operator may render the key in either base64
-		// alphabet and a service that only accepts one is a deployment trap.
-		key, err = base64.RawURLEncoding.DecodeString(cfg.GetTokenHmacKey())
-		if err != nil {
-			return fmt.Errorf("blobstore: token_hmac_key is not base64: %w", err)
-		}
-	}
-	signer, err := NewTokenSigner(key)
-	if err != nil {
-		return err
-	}
 	s.cfg.Store(&runtimeConfig{
 		groups:       groups,
-		signer:       signer,
 		uploadTTL:    time.Duration(cfg.GetUploadTokenTtlSeconds()) * time.Second,
 		statsFlush:   time.Duration(cfg.GetStatsFlushIntervalSeconds()) * time.Second,
 		sessionSweep: time.Duration(cfg.GetSessionSweepIntervalSeconds()) * time.Second,
