@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	blobstore_pb "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/types/services/blobstore"
+	blobstore_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/services/blobstore"
 )
 
 // The harness stands up the REAL pair: two Services, each with its own temp

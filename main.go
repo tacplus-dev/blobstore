@@ -20,10 +20,10 @@ import (
 	"net/http"
 	"time"
 
-	internal "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/internal/blobstore"
-	loggerchassis "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/chassis/logger"
-	sm "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/s2sm"
-	host_pb "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/types/sys/host"
+	internal "gitlab.com/seabeam/schematic/platform/services/blobstore/internal/blobstore"
+	loggerchassis "gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/logger"
+	sm "gitlab.com/seabeam/schematic/platform/services/blobstore/model/s2sm"
+	host_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/sys/host"
 	"go.uber.org/zap"
 )
 

@@ -1,4 +1,4 @@
-module gitlab.com/secondstarcavalier/schematic/platform/services/blobstore
+module gitlab.com/seabeam/schematic/platform/services/blobstore
 
 go 1.25.5
 

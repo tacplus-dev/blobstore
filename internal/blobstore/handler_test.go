@@ -5,10 +5,10 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/chassis/collection"
-	"gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/chassis/servicemanager"
-	wrapperToken "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/chassis/token"
-	blobstore_pb "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/types/services/blobstore"
+	"gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/collection"
+	"gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/servicemanager"
+	wrapperToken "gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/token"
+	blobstore_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/services/blobstore"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

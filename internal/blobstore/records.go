@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	query_gc "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/s2sm/grpc/clients/vservices/query"
-	blobstore_pb "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/types/services/blobstore"
-	query_pb "gitlab.com/secondstarcavalier/schematic/platform/services/blobstore/model/types/vservices/query"
+	query_gc "gitlab.com/seabeam/schematic/platform/services/blobstore/model/s2sm/grpc/clients/vservices/query"
+	blobstore_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/services/blobstore"
+	query_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/vservices/query"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
