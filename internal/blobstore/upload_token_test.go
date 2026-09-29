@@ -102,3 +102,18 @@ func TestUploadTokenIsRefusedAfterItHasBeenConsumed(t *testing.T) {
 		t.Fatalf("replayed PUT after the in-memory ledger was cleared: got %d, want 409", got)
 	}
 }
+
+// Single use across pods: the gateway round-robins `PUT /upload/`, so a replay
+// can land on the pod that did not take the first PUT. That pod has never seen
+// the upload in its in-memory ledger, so it is the settled row alone that refuses.
+func TestUploadTokenIsRefusedWhenReplayedOnThePeer(t *testing.T) {
+	p := newPair(t)
+	token, _ := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
+
+	if got := put(t, p.aBytes, token, pdfBody); got != http.StatusCreated {
+		t.Fatalf("first PUT on pod a: got %d, want 201", got)
+	}
+	if got := put(t, p.bBytes, token, pdfBody); got != http.StatusConflict {
+		t.Fatalf("replayed PUT on pod b: got %d, want 409", got)
+	}
+}
