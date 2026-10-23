@@ -10,7 +10,6 @@ import (
 
 	"gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/servicemanager"
 	blobstore_fe "gitlab.com/seabeam/schematic/platform/services/blobstore/model/s2sm/grpc/servers/services/blobstore"
-	eventbus_support_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/generated/eventbus_support"
 	blobstore_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/services/blobstore"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -499,87 +498,6 @@ func (h *Handler) BlobStoreGrpcImpl() blobstore_fe.BlobStoreHandler { return h }
 // update. An error on the first call stops the service from starting, which is what
 // a bad group rendering or a missing token key should do.
 func (h *Handler) BlobStoreConfig(cfg *blobstore_pb.Config) error { return h.svc.Configure(cfg) }
-
-// The <Record>BusState services below are the topic endpoints tacplus generates
-// for every (spec.record) declared in this package, and they are registered on
-// this service's gRPC server by the generated Run().
-//
-// BLOBSTORE IS NOT THE BROKER. A record's topic is hosted by eventbus; this
-// service's relationship with its own records is "publish onto the topic" (which
-// is what CreateBlobstore*Publisher does) and "read the stored rows back" (which
-// is the record plane). Nothing in the fleet dials blobstore for these, and
-// implementing them would mean this service pretending to be a message broker.
-//
-// So they are refused explicitly, UNIMPLEMENTED, rather than left nil. A nil
-// handler behind the generated wrapper is a panic waiting for the first caller;
-// this is an answer. The generated Handler interface requires them, which is a
-// tacplus gap for a Go service that both declares a record and serves its own
-// RPCs — reported in workers/blobstore-result.md rather than worked around
-// further.
-func (h *Handler) BlobBusStateGrpcImpl() blobstore_fe.BlobBusStateServiceHandler {
-	return blobBusNotHosted{}
-}
-func (h *Handler) BlobBusStateConfig(*blobstore_pb.Config) error { return nil }
-func (h *Handler) UploadSessionBusStateGrpcImpl() blobstore_fe.UploadSessionBusStateServiceHandler {
-	return uploadSessionBusNotHosted{}
-}
-func (h *Handler) UploadSessionBusStateConfig(*blobstore_pb.Config) error { return nil }
-func (h *Handler) BlobLinkBusStateGrpcImpl() blobstore_fe.BlobLinkBusStateServiceHandler {
-	return blobLinkBusNotHosted{}
-}
-func (h *Handler) BlobLinkBusStateConfig(*blobstore_pb.Config) error { return nil }
-func (h *Handler) BlobLinkStatsBusStateGrpcImpl() blobstore_fe.BlobLinkStatsBusStateServiceHandler {
-	return blobLinkStatsBusNotHosted{}
-}
-func (h *Handler) BlobLinkStatsBusStateConfig(*blobstore_pb.Config) error { return nil }
-
-// errBusNotHosted is the one answer all eight bus methods give.
-var errBusNotHosted = status.Error(codes.Unimplemented,
-	"blobstore does not host its records' topics; eventbus is the broker")
-
-// Four types rather than one, because the generated interfaces differ in their
-// stream MESSAGE type and a Go method set cannot be generic over that. Each is
-// two lines; a shared implementation would need the stream types to be parameters
-// of the interface, which they are not.
-type blobBusNotHosted struct{}
-
-func (blobBusNotHosted) PublishToStream(*servicemanager.Caller, grpc.BidiStreamingServer[blobstore_pb.Blob, eventbus_support_pb.PublishResponse]) error {
-	return errBusNotHosted
-}
-
-func (blobBusNotHosted) SubscribeToStream(*servicemanager.Caller, grpc.BidiStreamingServer[eventbus_support_pb.SubscribeRequest, blobstore_pb.BlobBusStreamSubscribeRecord]) error {
-	return errBusNotHosted
-}
-
-type uploadSessionBusNotHosted struct{}
-
-func (uploadSessionBusNotHosted) PublishToStream(*servicemanager.Caller, grpc.BidiStreamingServer[blobstore_pb.UploadSession, eventbus_support_pb.PublishResponse]) error {
-	return errBusNotHosted
-}
-
-func (uploadSessionBusNotHosted) SubscribeToStream(*servicemanager.Caller, grpc.BidiStreamingServer[eventbus_support_pb.SubscribeRequest, blobstore_pb.UploadSessionBusStreamSubscribeRecord]) error {
-	return errBusNotHosted
-}
-
-type blobLinkBusNotHosted struct{}
-
-func (blobLinkBusNotHosted) PublishToStream(*servicemanager.Caller, grpc.BidiStreamingServer[blobstore_pb.BlobLink, eventbus_support_pb.PublishResponse]) error {
-	return errBusNotHosted
-}
-
-func (blobLinkBusNotHosted) SubscribeToStream(*servicemanager.Caller, grpc.BidiStreamingServer[eventbus_support_pb.SubscribeRequest, blobstore_pb.BlobLinkBusStreamSubscribeRecord]) error {
-	return errBusNotHosted
-}
-
-type blobLinkStatsBusNotHosted struct{}
-
-func (blobLinkStatsBusNotHosted) PublishToStream(*servicemanager.Caller, grpc.BidiStreamingServer[blobstore_pb.BlobLinkStats, eventbus_support_pb.PublishResponse]) error {
-	return errBusNotHosted
-}
-
-func (blobLinkStatsBusNotHosted) SubscribeToStream(*servicemanager.Caller, grpc.BidiStreamingServer[eventbus_support_pb.SubscribeRequest, blobstore_pb.BlobLinkStatsBusStreamSubscribeRecord]) error {
-	return errBusNotHosted
-}
 
 // BlobstoreConfigStateGrpcImpl is the generated per-service config state surface.
 // It is served by the config store (kernel), not by this service, and is refused
