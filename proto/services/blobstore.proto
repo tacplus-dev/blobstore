@@ -1,0 +1,990 @@
+// blobstore — the platform's binary blob primitive.
+//
+// Decided in looper/schematic/decisions/blob-store-2026-09-25.md (v3:
+// self-hosted mirrored pair, volume groups, bearer links, no cloud
+// dependency). Read that doc before changing anything here; every requirement
+// referenced below as Rn is one of its numbered requirements.
+//
+// WHAT THIS IS. Two pods, each with its own PVC, holding the same
+// content-addressed files. Metadata is stratum records — this service is their
+// only writer (R1) — and the bytes move over two plain HTTP paths the gateway
+// proxies, `PUT /upload/<token>` and `GET|HEAD /b/<token>` (R3). There is no
+// cloud object store, no NFS, and no signed cloud URL: the "signed URL" is a
+// BEARER TOKEN BY RECORD — raw randomness whose sha256 is the key of the row
+// that holds the grant, so verification is a lookup and revocation is deleting
+// a row (R3, R7). There is no signing key anywhere in this service.
+//
+// WHAT THIS IS NOT. A filesystem. Every upload names a VOLUME GROUP declared at
+// build time by the consuming service, and the group is what bounds content
+// types, blob size and per-tenant quota (R4). No group, no upload.
+//
+// WHY THERE IS NO RPC THAT CARRIES BYTES. A blob is up to `max_blob_bytes`, and
+// the fleet's unary ceiling is 10MB. The byte paths are HTTP for the same
+// reason the ACME challenge responder in letsencrypt.proto is: the payload is
+// not a message.
+
+syntax = "proto3";
+
+package blobstore;
+
+import "sys/spec.proto";
+import "sys/host.proto";
+
+// The service ID is assigned in registry.yaml, not here. IDs are GLOBAL across
+// every proto repo merged into a build and the merge hard-errors on collision.
+option (spec.service) = {name: "blobstore"};
+
+// STORED-ROW READS. Every one of this service's own record types is read back:
+// `/b/<token>` resolves a BlobLink and then its Blob, `/upload/<token>` needs
+// the Blob row to know a hash is already promoted, the expiry sweep reads
+// UploadSession, and the metrics rollup reads BlobLinkStats before it adds to
+// it. The grant half of each pair is the record's own `s2s_read` below; neither
+// half works alone.
+option (spec.record_read) = {record: "blobstore.Blob"};
+option (spec.record_read) = {record: "blobstore.BlobLink"};
+option (spec.record_read) = {record: "blobstore.UploadSession"};
+option (spec.record_read) = {record: "blobstore.BlobLinkStats"};
+
+// ============================================================================
+// Config
+// ============================================================================
+
+// VolumeGroup is one group's rules, as this service receives them.
+//
+// IT IS NOT DECLARED HERE. A group is declared at BUILD TIME by the consuming
+// service — DocManager declares `documents`, a later feature declares `photos`
+// — through the `(spec.volume_group)` service-level annotation tacplus surfaces
+// in registry.json, and the operator renders every declared group into this
+// config (R4, and the doc's Work split: the annotation is tacplus's slice, the
+// rendering is the operator's). This message is the RECEIVING end of that
+// pipeline and nothing more.
+//
+// So the list below being EMPTY is the correct state of a cluster whose
+// services have declared no groups: every upload is then refused, which is what
+// "no group, no upload" means. It is not a reason to invent a default group.
+message VolumeGroup {
+  // name is the group's identity, and the first path segment of every file it
+  // holds (`<group>/<ns>/<sha256>`). Unique across the fleet — tacplus refuses
+  // a duplicate at generation, so this service does not have to arbitrate.
+  string name = 1 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 1,
+    (spec.assert_max_size) = 64
+  ];
+
+  // max_blob_bytes is the largest single blob the group accepts. Enforced ON
+  // THE WIRE, not from the declared size: an upload is aborted the moment the
+  // stream passes it (R9 step 2), because a client that lied about `size_bytes`
+  // must not be able to fill the disk before the check.
+  int64 max_blob_bytes = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_gt) = 0
+  ];
+
+  // content_types is the exhaustive allow-list. A type not listed is refused at
+  // CreateUpload, and the bytes are sniffed again at finish (R4) — a renamed
+  // `.exe` declaring `application/pdf` fails on its magic bytes even though it
+  // passed this list.
+  repeated string content_types = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 64,
+    (spec.assert_element_max_size) = 128
+  ];
+
+  // tenant_quota_bytes is the ceiling on the SUM of promoted blob sizes for one
+  // tenant in this group. Quotas hang off the group and there is no separate
+  // global tenant quota (R4).
+  int64 tenant_quota_bytes = 4 [
+    (spec.assert_required) = true,
+    (spec.assert_gt) = 0
+  ];
+}
+
+// Config is delivered by kernel at startup and on every change.
+message Config {
+  option (spec.grpc_config) = {service_name: "blobstore"};
+
+  // The four topics tacplus SYNTHESIZES from the records below — this service's
+  // durable write path. A record has no write RPC: it reaches stratum on
+  // stratum's own subscription to the topic, so publishing here IS writing the
+  // record. Same shape as letsencrypt's and mailbox's: no method_s2s, because
+  // the producer surface is declared on each record itself (s2s:
+  // ["blobstore"]) and the generator folds it in — restating it could only
+  // drift.
+  option (spec.event_publish) = {topic_ref: "blobstore.BlobBus.stream"};
+  option (spec.event_publish) = {topic_ref: "blobstore.UploadSessionBus.stream"};
+  option (spec.event_publish) = {topic_ref: "blobstore.BlobLinkBus.stream"};
+  option (spec.event_publish) = {topic_ref: "blobstore.BlobLinkStatsBus.stream"};
+
+  // volume_groups is every group declared anywhere in the fleet, rendered by
+  // the operator. See VolumeGroup: empty means no upload is possible, which is
+  // correct and not a misconfiguration to paper over.
+  repeated VolumeGroup volume_groups = 1 [(spec.assert_max_size) = 64];
+
+  // http_listener is the bind address for the BYTE PATHS — `PUT /upload/<t>`
+  // and `GET|HEAD /b/<t>`, and nothing else.
+  //
+  // IN-CLUSTER ONLY, exactly like letsencrypt's ACME responder: the gateway
+  // owns the edge and proxies these two prefixes here, so this listener needs
+  // no externally-exposed Service of its own. It is plaintext because the hop
+  // is in-cluster and the token in the path is the whole authorization; the
+  // gateway is what terminates TLS for the client.
+  host.Host http_listener = 2 [(spec.default_host) = {host: "0.0.0.0", port: 8080}];
+
+  // peer_listener is the bind address for the MIRROR AND ANTI-ENTROPY paths,
+  // and it is a second listener rather than three more prefixes on the first
+  // for one reason: the anti-entropy path ENUMERATES the hashes this pod holds.
+  // The gateway proxies only the two prefixes above, so nothing outside the
+  // cluster can reach this port at all.
+  host.Host peer_listener = 3 [(spec.default_host) = {host: "0.0.0.0", port: 8081}];
+
+  // peers is the `host:port` peer_listener address of EVERY replica, including
+  // this pod's own, from the StatefulSet's stable per-pod DNS
+  // (`blobstore-0.blobstore:8081,blobstore-1.blobstore:8081`). The pod finds
+  // itself by matching its hostname against the first DNS label and treats the
+  // rest as peers.
+  //
+  // Delivered by the operator as BLOBSTORE_PEERS, the same env shape as
+  // stratum's STRATUM_SEED_MEMBERS — peer wiring is deployment topology the
+  // operator already knows, and inventing a second typed path for it would
+  // only let the two disagree.
+  repeated string peers = 4 [(spec.assert_max_size) = 8, (spec.assert_element_max_size) = 253];
+
+  // data_dir is the PVC mount holding `<group>/<ns>/<sha256>` and the `tmp`
+  // directory partial uploads are written into.
+  //
+  // The default is UNDER /app/data because that is where the operator's chart
+  // mounts a service's volumeClaimTemplate (`- name: data / mountPath:
+  // /app/data`). A default anywhere else would put the blobs on the pod's
+  // ephemeral filesystem and lose them on every restart, which is the kind of
+  // mistake nothing would report — the writes would all succeed.
+  string data_dir = 5 [(spec.default_string) = "/app/data/blobs"];
+
+  // upload_token_ttl_seconds is how long a CreateUpload token is good for —
+  // the doc's ceiling is 15 minutes (R9 step 1) and that is the default. It
+  // bounds how long a reservation can sit unused, not how long an upload may
+  // take: the TTL is checked when the PUT arrives, not while it streams.
+  int64 upload_token_ttl_seconds = 7 [
+    (spec.default_int) = 900,
+    (spec.assert_ge) = 30,
+    (spec.assert_le) = 900
+  ];
+
+  // stats_flush_interval_seconds is the metrics rollup cadence: per-token
+  // counters live in memory and reach BlobLinkStats at most once a minute per
+  // token (R10). Held in config rather than as a constant for the same reason
+  // mailbox's sweep interval is — changing it must not need a rebuild.
+  int64 stats_flush_interval_seconds = 8 [
+    (spec.default_int) = 60,
+    (spec.assert_ge) = 10,
+    (spec.assert_le) = 3600
+  ];
+
+  // session_sweep_interval_seconds is how often expired UploadSession rows have
+  // their reservations released (R9 step 4). The same sweep deletes leftover
+  // `tmp` files, which is also done once unconditionally at start-up: a crash
+  // mid-upload leaves temp files and nothing else cleans them.
+  int64 session_sweep_interval_seconds = 9 [
+    (spec.default_int) = 60,
+    (spec.assert_ge) = 10,
+    (spec.assert_le) = 3600
+  ];
+}
+
+// ============================================================================
+// Records
+// ============================================================================
+
+// Blob is one promoted file: bytes that are fsynced and renamed into place on
+// BOTH pods. A Blob row never points at bytes that are not on both pods (R9).
+//
+// IMMUTABLE AND CONTENT-ADDRESSED, PER TENANT (R5). Identity is
+// `(group, namespace, content_hash)` and dedup is within a tenant and group
+// only: two tenants holding the same bytes hold two files and each pays. A
+// global key would have been a cross-tenant content oracle — ask whether a hash
+// exists and learn that someone else has the document — and it contradicted
+// DocHashIndex's own per-namespace rule.
+//
+// NO VERSIONING. A new version is a new blob and the consumer moves its own
+// pointer. The filename is the consumer's and lives on BlobLink, not here.
+message Blob {
+  option (spec.record) = {
+    key: "blob_id"
+    owner: "spiffe_id"
+
+    // PRODUCER surface: blobstore is the only writer of every record in this
+    // file (R1). Nothing else may assert that a blob exists.
+    s2s: {auth_services: ["blobstore"]}
+
+    // CONSUMER surface: stratum, the record store, and nobody else. stratum
+    // auto-derives a subscription to every (spec.record) topic, so omitting it
+    // denies the store the topic it exists to read.
+    s2s_subscribe: {auth_services: ["stratum"]}
+
+    // STORED-ROW READ: see the file-level (spec.record_read) block.
+    s2s_read: {auth_services: ["blobstore"]}
+
+    // NOT `private`. The owner here is a SERVICE, and `private` refuses the s2s
+    // paths this design needs (R6). The tenant boundary is
+    // (spec.store_namespace) on `namespace` and the service boundary is
+    // (spec.store_principal) on `owner_principal`, both below.
+
+    // idle_seconds 604800 — a week. A blob row is read on every `/b/` resolve
+    // and written once, so the platform one-day default would evict rows that a
+    // document opened weekly keeps reloading from disk. Nothing is lost either
+    // way; this is cache maintenance on a row small enough to keep.
+    //
+    // deleted_max_age_seconds 2592000 — thirty days, the platform default. It
+    // is LIVE on this type, which declares `deleted` below: a purged Blob row
+    // is how the store forgets a blob whose bytes the owner deleted.
+    residency: {idle_seconds: 604800 deleted_max_age_seconds: 2592000}
+  };
+
+  // blob_id is the record key and the file's path: `<group>/<ns>/<sha256-hex>`.
+  // Carried as one string rather than derived on read because it IS the key,
+  // and a key a reader has to assemble from three fields is a key two callers
+  // can assemble differently.
+  string blob_id = 1 [
+    (spec.indexed) = true,
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 1,
+    (spec.assert_max_size) = 512
+  ];
+
+  // group is the volume group this blob belongs to — the group whose rules
+  // admitted it. EQ-filterable because per-group quota accounting is a query
+  // over exactly this field plus `namespace`.
+  string group = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 64,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  // content_hash is the lowercase hex SHA-256 of the bytes, computed by this
+  // service AS THE UPLOAD STREAMS — native and exact. It is checked against the
+  // client's declared hash at end of stream and the upload fails if they
+  // differ (R9 step 3).
+  string content_hash = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 64,
+    (spec.assert_max_size) = 64,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  // size_bytes is the byte count as counted on the wire, not as declared.
+  int64 size_bytes = 4 [(spec.assert_ge) = 0];
+
+  // content_type is what `GET /b/` serves. It survived both the group's
+  // allow-list and the magic-byte sniff, so it describes the stored bytes
+  // rather than merely what the uploader said about them.
+  string content_type = 5 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 128
+  ];
+
+  // created_ms is when the blob was promoted. RANGE-filterable: "what landed
+  // this week" is a question about this field, and it is what a later GC over
+  // consumers' pointers (R12) would scan.
+  int64 created_ms = 6 [
+    (spec.assert_ge) = 0,
+    (spec.query_field) = {op: QUERY_OP_RANGE}
+  ];
+
+  // owner_principal is the OWNING SERVICE identity — docmanager, not blobstore
+  // — and the row's owning principal (R6). Only this identity creates or
+  // revokes links or deletes the blob.
+  //
+  // `spiffe_id` below is the record's declared owner but is the PUBLISHER,
+  // which is always blobstore, so it is the wrong field to filter an owner's
+  // reads on — the same split mailbox.MailboxEntry makes between `recipient`
+  // and `spiffe_id`.
+  string owner_principal = 7 [
+    (spec.store_principal) = true,
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  // deleted marks the blob logically gone. The BYTES are not deleted by the
+  // record: the owner's Delete is what unlinks them from both pods, and this
+  // flag is what stops a resolve and starts the purge clock.
+  bool deleted = 8 [(spec.deleted_flag) = true];
+
+  // spiffe_id is the record's owner in the store's sense — the publisher, which
+  // is blobstore's own workload identity. See owner_principal.
+  string spiffe_id = 9 [
+    (spec.identity_spiffe_subject) = true,
+    (spec.assert_max_size) = 1024,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  // namespace is the OWNING TENANT (R6) and the second segment of blob_id. It
+  // is what makes dedup per-tenant: the same bytes under two namespaces are two
+  // rows and two files.
+  string namespace = 10 [
+    (spec.store_namespace) = true,
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+}
+
+// UploadState is where one upload got to.
+enum UploadState {
+  UPLOAD_STATE_UNSPECIFIED = 0;
+  // PENDING: quota is reserved and the token is live. No bytes have been
+  // promoted.
+  UPLOAD_STATE_PENDING = 1;
+  // COMMITTED: the bytes are fsynced and renamed on both pods and the Blob row
+  // is published. The reservation became real usage.
+  UPLOAD_STATE_COMMITTED = 2;
+  // ABORTED: CancelUpload, an expiry sweep, or a failed PUT. Temps are gone
+  // from both pods and the reservation is released.
+  UPLOAD_STATE_ABORTED = 3;
+}
+
+// UploadSession is one upload's durable reservation and audit trail (R9).
+//
+// IT IS THE AUTHORIZATION FOR THE PUT. The upload token carries nothing: it is
+// raw randomness, and this row — keyed by its sha256 — is where the upload's
+// terms live. A pod receiving a PUT hashes the token, reads this row, and takes
+// the group, namespace, declared hash, size and content type from it. Exactly
+// the shape BlobLink gives a `/b/` token (R3, R7); there is no signing key and
+// nothing to rotate.
+//
+// THE COST, STATED: a record reaches stratum on an eventbus publish, which is
+// enqueue-and-retry, so a PUT arriving milliseconds after CreateUpload returned
+// can find this row missing and be refused. BlobLink has had exactly that race
+// since it was written and it is accepted there for the same reason — a caller
+// that just asked for the token retries.
+//
+// This row is ALSO the quota reservation, the expiry sweep that releases it, the
+// single-use ledger (state leaves PENDING once), and the answer to "what was
+// uploaded, by whom, when".
+message UploadSession {
+  option (spec.record) = {
+    key: "upload_id"
+    owner: "spiffe_id"
+    s2s: {auth_services: ["blobstore"]}
+    s2s_subscribe: {auth_services: ["stratum"]}
+    s2s_read: {auth_services: ["blobstore"]}
+
+    // idle_seconds 3600 — an hour, comfortably past the 15-minute token TTL and
+    // the sweep that follows it. A session row is touched two or three times
+    // inside a few minutes and then never again; keeping it resident for a week
+    // would be keeping the one row type here that has no reader after it
+    // settles.
+    //
+    // deleted_max_age_seconds 2592000 — the platform default, live on this type:
+    // a settled session is flagged deleted and purged a month later, which is
+    // how the reservation ledger stays bounded.
+    residency: {idle_seconds: 3600 deleted_max_age_seconds: 2592000}
+  };
+
+  // upload_id is the record key: the lowercase hex SHA-256 of the raw upload
+  // token, exactly as BlobLink.token_hash is for a `/b/` token. A PUT hashes
+  // what arrived in the path and looks up THAT, so the key is not a secret even
+  // though the path is. It is derived from the token and not from the content
+  // hash: two tenants uploading the same bytes at the same time are two
+  // sessions.
+  string upload_id = 1 [
+    (spec.indexed) = true,
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 1,
+    (spec.assert_max_size) = 128
+  ];
+
+  // group, content_hash, size_bytes and content_type are what the upload
+  // DECLARED. The Blob row carries what actually arrived; the two are compared
+  // at end of stream and a mismatch fails the upload (R9 step 3).
+  string group = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 64,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+  string content_hash = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 64,
+    (spec.assert_max_size) = 64
+  ];
+  int64 size_bytes = 4 [(spec.assert_ge) = 0];
+  string content_type = 5 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 128
+  ];
+
+  // reserved_bytes is what this session holds against the tenant's group quota
+  // while it is PENDING. It is the DECLARED size — the only number available
+  // before the bytes arrive — which is why `max_blob_bytes` is also enforced on
+  // the wire: the reservation is a promise the stream still has to keep.
+  int64 reserved_bytes = 6 [(spec.assert_ge) = 0];
+
+  // state is the session's terminal answer. See UploadState.
+  UploadState state = 7 [(spec.assert_enum_defined) = true];
+
+  // created_ms and expires_ms bound the token. expires_ms is checked when the
+  // PUT ARRIVES, not while it streams: a 50 MiB upload on a slow link must not
+  // fail at minute 16 having transferred everything.
+  int64 created_ms = 8 [(spec.assert_ge) = 0];
+  int64 expires_ms = 9 [
+    (spec.assert_ge) = 0,
+    (spec.query_field) = {op: QUERY_OP_RANGE}
+  ];
+
+  // owner_principal and namespace are the owning service and owning tenant, as
+  // on Blob. The reservation is against exactly this pair's group quota.
+  string owner_principal = 10 [
+    (spec.store_principal) = true,
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  bool deleted = 11 [(spec.deleted_flag) = true];
+
+  string spiffe_id = 12 [
+    (spec.identity_spiffe_subject) = true,
+    (spec.assert_max_size) = 1024
+  ];
+
+  string namespace = 13 [
+    (spec.store_namespace) = true,
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+}
+
+// LinkPolicy is who may resolve a link.
+enum LinkPolicy {
+  LINK_POLICY_UNSPECIFIED = 0;
+  // BEARER: whoever holds the token. The only policy today (R7); SAME_TENANT
+  // and FLEET_ONLY are additive later and need a caller identity on the `/b/`
+  // path, which BEARER deliberately does not have.
+  LINK_POLICY_BEARER = 1;
+}
+
+// BlobLink is one shareable URL, keyed by the HASH of its token (R7).
+//
+// THE RAW TOKEN APPEARS NOWHERE PERSISTENT. It is returned once, by the call
+// that minted it, and this row holds only `sha256(token)`; ListLinks returns no
+// tokens, and the gateway redacts `/b/*` and `/upload/*` paths from its logs.
+// So a reader of the record store — or of a log, or of a backup — cannot
+// resolve any link.
+//
+// REVOCATION IS IMMEDIATE, which is v3's improvement over the v2 signed-URL
+// design: we serve the bytes, so `revoked_ms` is checked on every resolve
+// rather than waiting for a cloud URL to expire. It is kept rather than deleted
+// so an audit can still say a link existed.
+message BlobLink {
+  option (spec.record) = {
+    key: "token_hash"
+    owner: "spiffe_id"
+    s2s: {auth_services: ["blobstore"]}
+    s2s_subscribe: {auth_services: ["stratum"]}
+    s2s_read: {auth_services: ["blobstore"]}
+
+    // idle_seconds 604800 — a week, matching Blob: a link is read on every
+    // resolve of the blob it points at, so the two age on the same clock.
+    residency: {idle_seconds: 604800 deleted_max_age_seconds: 2592000}
+  };
+
+  // token_hash is the record key: the lowercase hex SHA-256 of the raw token.
+  // A resolve hashes what arrived in the path and looks up THAT, so the lookup
+  // key is not a secret even though the path is.
+  string token_hash = 1 [
+    (spec.indexed) = true,
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 64,
+    (spec.assert_max_size) = 64
+  ];
+
+  // blob_id is the Blob this link resolves to.
+  string blob_id = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 512,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  // filename is what `Content-Disposition` offers, and the ONLY source of it
+  // (R8) — never a client-supplied header, never a query parameter. Validated
+  // at mint: a basename, no CR/LF, quote, backslash, semicolon, control
+  // character or path separator.
+  string filename = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 1,
+    (spec.assert_max_size) = 255
+  ];
+
+  LinkPolicy policy = 4 [(spec.assert_enum_defined) = true];
+
+  int64 created_ms = 5 [(spec.assert_ge) = 0];
+
+  // expires_ms is 0 for a durable shared link and non-zero for the short-lived
+  // one the owner mints for its own use. Checked on resolve alongside
+  // revoked_ms; the two are indistinguishable to the caller, who gets a 404
+  // either way.
+  int64 expires_ms = 6 [
+    (spec.assert_ge) = 0,
+    (spec.query_field) = {op: QUERY_OP_RANGE}
+  ];
+
+  // revoked_ms is when the owner revoked the link, 0 while live. The row is
+  // KEPT — see the type comment.
+  int64 revoked_ms = 7 [(spec.assert_ge) = 0];
+
+  string owner_principal = 8 [
+    (spec.store_principal) = true,
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  bool deleted = 9 [(spec.deleted_flag) = true];
+
+  string spiffe_id = 10 [
+    (spec.identity_spiffe_subject) = true,
+    (spec.assert_max_size) = 1024
+  ];
+
+  string namespace = 11 [
+    (spec.store_namespace) = true,
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+}
+
+// BlobLinkStats is the coarse rollup of one link's resolutions (R10).
+//
+// The counters live IN MEMORY on the pod that served the request and are
+// flushed here at most once a minute per token. That is the whole design: a
+// `/b/` resolve must not cost a record write, and nobody needs a resolution
+// count to be exact.
+//
+// `bytes_served` is honest here in a way it could not be in the v2 cloud
+// design: we serve the bytes ourselves, so we count them rather than inferring
+// them from a signed URL that may or may not have been followed.
+//
+// TWO PODS, TWO COUNTERS. Each pod flushes what it served, and a flush is a
+// read-modify-write of this row — so the row is the SUM only as of the last
+// flush either pod made. Exactness was never on offer for an in-memory counter;
+// what matters is that a flush never loses another pod's contribution, which is
+// why it reads before it adds.
+message BlobLinkStats {
+  option (spec.record) = {
+    key: "token_hash"
+    owner: "spiffe_id"
+    s2s: {auth_services: ["blobstore"]}
+    s2s_subscribe: {auth_services: ["stratum"]}
+    s2s_read: {auth_services: ["blobstore"]}
+
+    // idle_seconds 604800 — a week, with BlobLink: a stats row is touched on
+    // the same cadence as the link it counts.
+    //
+    // deleted_max_age_seconds 2592000 — the platform default, and INERT: this
+    // type declares no (spec.deleted_flag). A stats row is replaced, never
+    // deleted; when the link goes the row ages out of memory and sits on disk.
+    // It is stated rather than omitted so a type that later gains the marker
+    // does not also have to gain a number.
+    residency: {idle_seconds: 604800 deleted_max_age_seconds: 2592000}
+  };
+
+  // token_hash is the key, and the same key BlobLink carries — the two rows are
+  // one link's two halves, split because the stats half is rewritten on a
+  // minute cadence and the link half is written once.
+  string token_hash = 1 [
+    (spec.indexed) = true,
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 64,
+    (spec.assert_max_size) = 64
+  ];
+
+  int64 resolutions = 2 [(spec.assert_ge) = 0];
+  int64 bytes_served = 3 [(spec.assert_ge) = 0];
+  int64 last_resolved_ms = 4 [
+    (spec.assert_ge) = 0,
+    (spec.query_field) = {op: QUERY_OP_RANGE}
+  ];
+
+  string owner_principal = 5 [
+    (spec.store_principal) = true,
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+
+  string spiffe_id = 6 [
+    (spec.identity_spiffe_subject) = true,
+    (spec.assert_max_size) = 1024
+  ];
+
+  string namespace = 7 [
+    (spec.store_namespace) = true,
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256,
+    (spec.query_field) = {op: QUERY_OP_EQ}
+  ];
+}
+
+// ============================================================================
+// Service
+// ============================================================================
+
+// BlobStore is the owning service's control surface. Every RPC is s2s: the
+// owner of a blob is a SERVICE identity (R6), and there is no user-facing RPC
+// here at all — a person reaches a blob through the `/b/` path with a token
+// their service minted for them.
+//
+// VERB NAMES DIFFER FROM THE DECISION DOC'S SKETCH, which wrote BeginUpload,
+// AbortUpload and GetBlobUrl. The RPC verb registry is CLOSED
+// (tacplus/pkg/internal/common/verbs/registry.json) and is enforced on s2s
+// services as well as c2s (parser.serviceEnforcesVerbs), so `Begin` and `Abort`
+// do not generate at all. The registered verbs whose definitions are these
+// operations are used instead:
+//
+//   BeginUpload  -> CreateUpload   ("bring a new resource into existence" — the
+//                                   UploadSession row is that resource)
+//   AbortUpload  -> CancelUpload   ("stop in-flight work", which is the session)
+//   GetBlobUrl   -> CreateBlobUrl  (Get's boundary is "must not mutate state",
+//                                   and minting a self-use link writes a
+//                                   BlobLink row)
+//
+// Nothing about the semantics the doc settled changes.
+service BlobStore {
+  option (spec.service_s2s) = {};
+
+  // CreateUpload checks the group's rules and the tenant's quota, reserves the
+  // quota, writes an UploadSession row, and returns the single-use upload token
+  // (R9 step 1). It does not touch a byte.
+  rpc CreateUpload(CreateUploadRequest) returns (CreateUploadResponse) {
+    option (spec.rpc) = {
+      principal: RPC_PRINCIPAL_SERVICE
+      auth_services: ["*"]
+      target_namespace_field: "namespace"
+    };
+  }
+
+  // CancelUpload releases the reservation and settles the session ABORTED.
+  // IDEMPOTENT: cancelling a session that has already settled is a no-op, not
+  // an error, because a client that times out and retries must not fail on it.
+  rpc CancelUpload(CancelUploadRequest) returns (CancelUploadResponse) {
+    option (spec.rpc) = {
+      principal: RPC_PRINCIPAL_SERVICE
+      auth_services: ["*"]
+      target_namespace_field: "namespace"
+    };
+  }
+
+  // CreateLink mints a shareable bearer link for a blob the caller owns and
+  // returns the raw token EXACTLY ONCE (R7). The token is never stored and
+  // cannot be recovered; a caller that loses it mints another.
+  rpc CreateLink(CreateLinkRequest) returns (CreateLinkResponse) {
+    option (spec.rpc) = {
+      principal: RPC_PRINCIPAL_SERVICE
+      auth_services: ["*"]
+      target_namespace_field: "namespace"
+    };
+  }
+
+  // CreateBlobUrl mints a SHORT-LIVED link for the owner's own use — the
+  // doc's GetBlobUrl, renamed per the service comment. Same row type, same
+  // path; only `expires_ms` differs, and it is required here.
+  rpc CreateBlobUrl(CreateBlobUrlRequest) returns (CreateBlobUrlResponse) {
+    option (spec.rpc) = {
+      principal: RPC_PRINCIPAL_SERVICE
+      auth_services: ["*"]
+      target_namespace_field: "namespace"
+    };
+  }
+
+  // RevokeLink stops a link resolving, immediately. The row is kept with
+  // `revoked_ms` set, for audit. IDEMPOTENT.
+  rpc RevokeLink(RevokeLinkRequest) returns (RevokeLinkResponse) {
+    option (spec.rpc) = {
+      principal: RPC_PRINCIPAL_SERVICE
+      auth_services: ["*"]
+      target_namespace_field: "namespace"
+    };
+  }
+
+  // ListLinks returns the caller's links for one blob, WITHOUT tokens (R7).
+  //
+  // PAGED rather than a single snapshot. This was originally forced by a tacplus
+  // Go-emitter bug (a unary COLLECTION_MODE_SNAPSHOT method compiled to a
+  // server-streaming wrapper against a unary descriptor) — tacplus@7c483bab fixed
+  // that (see tacplus/looper/workers/blobstore-gaps-result.md), so SNAPSHOT would
+  // work now too. Left as PAGE anyway: it's the standard envelope tacplus
+  // validates, not a bespoke one, and reworking already-tested/committed
+  // request/response shapes back to a bare snapshot buys nothing a bounded
+  // hundred-row page doesn't already give.
+  rpc ListLinks(ListLinksRequest) returns (ListLinksResponse) {
+    option (spec.rpc) = {
+      principal: RPC_PRINCIPAL_SERVICE
+      auth_services: ["*"]
+      target_namespace_field: "namespace"
+    };
+    option (spec.method_collection) = {
+      mode: COLLECTION_MODE_PAGE,
+      order_by: ["token_hash"],
+      default_page_size: 100
+    };
+  }
+
+  // DeleteBlob unlinks the bytes from both pods and flags the Blob row deleted.
+  // Owner-only, like every RPC here.
+  //
+  // It is NOT garbage collection: the store cannot know when a blob is
+  // unreferenced, because the pointers live in consumers (R12). This is the
+  // owner saying "I am done with this one".
+  rpc DeleteBlob(DeleteBlobRequest) returns (DeleteBlobResponse) {
+    option (spec.rpc) = {
+      principal: RPC_PRINCIPAL_SERVICE
+      auth_services: ["*"]
+      target_namespace_field: "namespace"
+    };
+  }
+
+  // GetLinkStats returns one link's rollup as of the last flush (R10).
+  rpc GetLinkStats(GetLinkStatsRequest) returns (BlobLinkStats) {
+    option (spec.rpc) = {
+      principal: RPC_PRINCIPAL_SERVICE
+      auth_services: ["*"]
+      target_namespace_field: "namespace"
+    };
+  }
+}
+
+message CreateUploadRequest {
+  // group is the volume group the blob goes into. A group this cluster's config
+  // does not name is refused — "no group, no upload" (R4).
+  string group = 1 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 64
+  ];
+
+  // content_hash is the caller's DECLARED lowercase hex SHA-256. It is recorded
+  // on the UploadSession the token resolves to, so the token authorizes exactly
+  // these bytes and no others — which is what makes a replayed token harmless
+  // rather than dangerous.
+  string content_hash = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 64,
+    (spec.assert_max_size) = 64
+  ];
+
+  // size_bytes is the declared size, and what is reserved against quota. The
+  // wire is still counted and still capped at the group's max_blob_bytes.
+  int64 size_bytes = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_gt) = 0
+  ];
+
+  // content_type must be in the group's allow-list, and the bytes are sniffed
+  // against it at finish.
+  string content_type = 4 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 128
+  ];
+
+  // namespace is the owning tenant, and (spec.rpc).target_namespace_field: the
+  // generated authorizer holds the caller to its own namespace or below before
+  // the handler runs, so a service cannot reserve quota in another tenant.
+  string namespace = 5 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256
+  ];
+}
+
+message CreateUploadResponse {
+  // upload_id is the UploadSession key, and what CancelUpload names.
+  string upload_id = 1 [(spec.assert_max_size) = 128];
+
+  // upload_token is the raw single-use token. The client PUTs to
+  // `/upload/<upload_token>` through the gateway. Returned once and stored
+  // nowhere.
+  string upload_token = 2 [(spec.assert_max_size) = 1024];
+
+  // upload_path is `/upload/<upload_token>` — the path to PUT to, assembled
+  // here so a caller does not hard-code the prefix.
+  string upload_path = 3 [(spec.assert_max_size) = 1024];
+
+  // expires_ms is when the token stops being accepted.
+  int64 expires_ms = 4 [(spec.assert_ge) = 0];
+
+  // already_present is true when a blob with these bytes is ALREADY promoted
+  // for this tenant and group. The token is still returned and the PUT still
+  // works (it dedups), but a caller that checks this can skip transferring the
+  // bytes entirely — which is the whole point of the consumer declaring the
+  // hash up front.
+  bool already_present = 5;
+
+  // blob_id is the id the bytes will have, `<group>/<ns>/<sha256>`. Known
+  // before the upload because the key is the content hash the caller declared.
+  string blob_id = 6 [(spec.assert_max_size) = 512];
+}
+
+message CancelUploadRequest {
+  string upload_id = 1 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 128
+  ];
+  string namespace = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256
+  ];
+}
+
+message CancelUploadResponse {
+  // cancelled is false when the session had already settled — committed,
+  // aborted, or expired and swept. Not an error; see CancelUpload.
+  bool cancelled = 1;
+}
+
+message CreateLinkRequest {
+  string blob_id = 1 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 512
+  ];
+
+  // filename is what the download is offered as. Validated here, once, and
+  // stored — `GET /b/` never takes a filename from the request (R8).
+  string filename = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 1,
+    (spec.assert_max_size) = 255
+  ];
+
+  string namespace = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256
+  ];
+}
+
+message CreateLinkResponse {
+  // token is the raw bearer token — 256 random bits, base64url. RETURNED ONCE.
+  string token = 1 [(spec.assert_max_size) = 1024];
+
+  // link_path is `/b/<token>`, the path the holder GETs.
+  string link_path = 2 [(spec.assert_max_size) = 1024];
+
+  // token_hash is the BlobLink key, and what RevokeLink names. Safe to keep:
+  // it cannot be turned back into the token.
+  string token_hash = 3 [(spec.assert_max_size) = 64];
+
+  int64 created_ms = 4 [(spec.assert_ge) = 0];
+}
+
+message CreateBlobUrlRequest {
+  string blob_id = 1 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 512
+  ];
+  string filename = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 1,
+    (spec.assert_max_size) = 255
+  ];
+
+  // ttl_seconds is how long this self-use link lives. Required and capped at an
+  // hour: the point of this RPC rather than CreateLink is that the link goes
+  // away on its own.
+  int64 ttl_seconds = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_gt) = 0,
+    (spec.assert_le) = 3600
+  ];
+
+  string namespace = 4 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256
+  ];
+}
+
+message CreateBlobUrlResponse {
+  string token = 1 [(spec.assert_max_size) = 1024];
+  string link_path = 2 [(spec.assert_max_size) = 1024];
+  string token_hash = 3 [(spec.assert_max_size) = 64];
+  int64 expires_ms = 4 [(spec.assert_ge) = 0];
+}
+
+message RevokeLinkRequest {
+  // token_hash names the link, not the token: a caller revoking a link it
+  // minted has the hash from CreateLinkResponse and must not have to keep the
+  // token around to be able to revoke it.
+  string token_hash = 1 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 64,
+    (spec.assert_max_size) = 64
+  ];
+  string namespace = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256
+  ];
+}
+
+message RevokeLinkResponse {
+  // revoked is false when the link was already revoked. Idempotent.
+  bool revoked = 1;
+  int64 revoked_ms = 2 [(spec.assert_ge) = 0];
+}
+
+message ListLinksRequest {
+  string blob_id = 1 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 512
+  ];
+  string namespace = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256
+  ];
+
+  // page_size and page_token are the PAGE envelope tacplus validates. page_size
+  // 0 means "use default_page_size"; page_token is opaque to the caller and is
+  // the last token_hash of the previous page — the keyset cursor over the
+  // declared order_by, so a page is stable under concurrent CreateLink.
+  int32 page_size = 3 [(spec.assert_ge) = 0, (spec.assert_le) = 100];
+  string page_token = 4 [(spec.assert_max_size) = 64];
+}
+
+message ListLinksResponse {
+  // links carries the record type rather than a hand-rolled summary row,
+  // because (spec.store_principal) and (spec.store_namespace) filter repeated
+  // fields OF THAT RECORD TYPE on the way out — a bespoke row would be a read
+  // path with the generated backstop switched off.
+  //
+  // NO TOKENS ARE IN HERE, and none can be: BlobLink holds only the hash.
+  repeated BlobLink links = 1 [(spec.assert_max_size) = 100];
+
+  // next_page_token is empty on the last page. It is the PAGE envelope's other
+  // half; see ListLinksRequest.page_token.
+  string next_page_token = 2 [(spec.assert_max_size) = 64];
+}
+
+message DeleteBlobRequest {
+  string blob_id = 1 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 512
+  ];
+  string namespace = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256
+  ];
+}
+
+message DeleteBlobResponse {
+  // deleted is false when the blob was already flagged deleted.
+  bool deleted = 1;
+}
+
+message GetLinkStatsRequest {
+  string token_hash = 1 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 64,
+    (spec.assert_max_size) = 64
+  ];
+  string namespace = 2 [
+    (spec.assert_required) = true,
+    (spec.assert_max_size) = 256
+  ];
+}
