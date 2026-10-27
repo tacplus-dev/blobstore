@@ -1,7 +1,10 @@
 # Blobstore Release Image
 # Layers the blobstore binary onto a minimal Alpine base.
 
-FROM registry.gitlab.com/seabeam/schematic/containers/alpine/schematic-alpine-1-2:latest
+# The base is a build argument: a fleet may hand in its own hardened base, the
+# default is the public one (no private registry in a public contract's repo).
+ARG BASE_IMAGE=alpine:3.24
+FROM ${BASE_IMAGE}
 
 ARG BUILD_DATE
 ARG VCS_REF
@@ -15,6 +18,7 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.title="BlobStore" \
       org.opencontainers.image.description="Content-addressed blob store for the Schematic control plane"
 
+RUN apk add --no-cache ca-certificates
 COPY bin/blobstore /usr/local/bin/blobstore
 
 ENTRYPOINT ["blobstore"]
