@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	blobstore_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/services/blobstore"
+	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
 )
 
 // sniffBytes is how much of the head of the stream is kept for the magic-byte

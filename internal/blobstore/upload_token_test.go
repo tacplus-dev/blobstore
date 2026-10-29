@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"testing"
 
-	blobstore_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/services/blobstore"
+	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
 )
 
 // The upload token is a BEARER TOKEN BY RECORD (R3, R9): verification is hashing

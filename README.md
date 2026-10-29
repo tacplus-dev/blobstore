@@ -5,7 +5,8 @@ files, with its metadata in stratum records.
 
 Design: `looper/schematic/decisions/blob-store-2026-09-25.md` (v3 — self-hosted,
 no cloud object store, no signed cloud URLs). Surface:
-`platform/proto/services/blobstore.proto`. Read both before changing anything
+`proto/services/blobstore.proto`, held in this repository (`src: proto`; its
+dependencies' protos come from tacplus-dev through `depends`). Read both before changing anything
 here; every non-obvious choice in this service traces to a numbered requirement
 in that doc and the code cites them as `R1`…`R13`.
 
@@ -45,11 +46,11 @@ No group, no upload.
 ## Local development
 
 ```
-just generate     # regenerate model/ from the proto (tacplus)
+just generate     # regenerate tacplus/ from the proto (tacplus)
 go build ./...
 go test ./...
 ```
 
-`model/` is generated and gitignored. The tests need no cluster: they stand up
+`tacplus/` is generated and gitignored. The tests need no cluster: they stand up
 two real Services on two temp directories with a real peer listener between them,
 and stub only stratum.

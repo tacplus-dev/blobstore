@@ -1,4 +1,4 @@
-module gitlab.com/seabeam/schematic/platform/services/blobstore
+module github.com/tacplus-dev/blobstore
 
 go 1.25.5
 

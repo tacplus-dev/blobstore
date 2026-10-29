@@ -1,9 +1,10 @@
 language: go
 # compiler floor: the looper runs the latest 2.5.x image (stratum, a dependency, needs 2.5: #7).
 tacplus: "2.5"
-# pkg kept as copied so the hand-written code keeps compiling; moves with the packages later.
-pkg: com.gitlab.seabeam.schematic.platform.services.blobstore
-output-dir: model
+# pkg is derived from go.mod (github.com/tacplus-dev/blobstore: the org name has a hyphen,
+# which pkg cannot carry). A derived Go package is <module>/tacplus, so the output is "tacplus".
+output-dir: tacplus
+output-name: tacplus
 src: proto
 # records here declare residency; the record query plane that reads them is the
 # query trait hosted by stratum, so stratum's contract is part of this build.

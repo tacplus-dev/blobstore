@@ -6,11 +6,11 @@ import (
 	"sort"
 	"time"
 
-	"gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/collection"
+	"github.com/tacplus-dev/blobstore/tacplus/chassis/collection"
 
-	"gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/servicemanager"
-	blobstore_fe "gitlab.com/seabeam/schematic/platform/services/blobstore/model/s2sm/grpc/servers/services/blobstore"
-	blobstore_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/services/blobstore"
+	"github.com/tacplus-dev/blobstore/tacplus/chassis/servicemanager"
+	blobstore_fe "github.com/tacplus-dev/blobstore/tacplus/s2sm/grpc/servers/services/blobstore"
+	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	blobstore_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/services/blobstore"
+	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
 )
 
 // Every test in this file is one line of the decision doc's Tests list, in its

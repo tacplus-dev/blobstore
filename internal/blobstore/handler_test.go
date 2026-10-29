@@ -5,10 +5,10 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/collection"
-	"gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/servicemanager"
-	wrapperToken "gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/token"
-	blobstore_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/services/blobstore"
+	"github.com/tacplus-dev/blobstore/tacplus/chassis/collection"
+	"github.com/tacplus-dev/blobstore/tacplus/chassis/servicemanager"
+	wrapperToken "github.com/tacplus-dev/blobstore/tacplus/chassis/token"
+	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	blobstore_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/services/blobstore"
+	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
 	"go.uber.org/zap"
 )
 

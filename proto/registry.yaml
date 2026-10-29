@@ -4,5 +4,5 @@ registries:
 services:
     - name: blobstore
       id: 58
-      contract: https://gitlab.com/seabeam/schematic/platform/proto.git
+      contract: https://github.com/tacplus-dev/blobstore.git
       visibility: private

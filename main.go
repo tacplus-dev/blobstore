@@ -20,10 +20,10 @@ import (
 	"net/http"
 	"time"
 
-	internal "gitlab.com/seabeam/schematic/platform/services/blobstore/internal/blobstore"
-	loggerchassis "gitlab.com/seabeam/schematic/platform/services/blobstore/model/chassis/logger"
-	sm "gitlab.com/seabeam/schematic/platform/services/blobstore/model/s2sm"
-	host_pb "gitlab.com/seabeam/schematic/platform/services/blobstore/model/types/sys/host"
+	internal "github.com/tacplus-dev/blobstore/internal/blobstore"
+	loggerchassis "github.com/tacplus-dev/blobstore/tacplus/chassis/logger"
+	sm "github.com/tacplus-dev/blobstore/tacplus/s2sm"
+	host_pb "github.com/tacplus-dev/blobstore/tacplus/types/sys/host"
 	"go.uber.org/zap"
 )
 

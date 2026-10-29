@@ -5,5 +5,6 @@ the looper then marks it `promoted` or `declined` here with the date.
 
 ## Open
 - **ROADMAP.md: the floor is 2.5, not 2.4** (2026-10-29, #7): tacplus.yaml now declares `tacplus: "2.5"` (stratum, a dependency, needs 2.5). The "Now" line still says "tacplus floor 2.4 ... #1 still open", and the "Later" line "Declare the tacplus floor 2.4 (#1)" is replaced by #7; #3, #4, #5 and #2 are listed as blocked by #1, which #7 supersedes. Needs an agent at Jody's request.
+- **ROADMAP.md: #3 is done; #5 may already be** (2026-10-29, #3): the module is `github.com/tacplus-dev/blobstore` and no SeaBeam reference is left outside PROVENANCE.md and the planning records (the gates now check it). ROADMAP.md's "Later" line for #3 can go. The Dockerfile's default base is already `alpine:3.24` (a build argument), so #5 looks satisfied too; worth a look before its looper runs. Needs an agent at Jody's request.
 
 ## Promoted / declined

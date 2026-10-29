@@ -6,7 +6,7 @@ bin/
 *.so
 *.test
 *.out
-model/
+tacplus/
 
 # macOS
 .DS_Store
