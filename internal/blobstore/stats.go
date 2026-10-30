@@ -38,8 +38,10 @@ type Stats struct {
 
 // statsEntry is one token's unflushed delta plus the identity the row needs. The
 // owner and namespace are carried because a flush may be the row's FIRST write
-// and a record cannot be written without them.
+// and a record cannot be written without them; the tenant, because the row is in
+// that tenant's store, which the flush must name (#8).
 type statsEntry struct {
+	tenant         string
 	ownerPrincipal string
 	namespace      string
 	resolutions    int64
@@ -56,12 +58,12 @@ func NewStats(records Records, now func() time.Time) *Stats {
 
 // Record adds one resolution. Called after the bytes are on their way out, not
 // before: a request that failed to serve is not a resolution.
-func (s *Stats) Record(tokenHash, ownerPrincipal, namespace string, bytesServed int64) {
+func (s *Stats) Record(tenant, tokenHash, ownerPrincipal, namespace string, bytesServed int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.pending[tokenHash]
 	if e == nil {
-		e = &statsEntry{ownerPrincipal: ownerPrincipal, namespace: namespace}
+		e = &statsEntry{tenant: tenant, ownerPrincipal: ownerPrincipal, namespace: namespace}
 		s.pending[tokenHash] = e
 	}
 	e.resolutions++
@@ -69,7 +71,8 @@ func (s *Stats) Record(tokenHash, ownerPrincipal, namespace string, bytesServed 
 	e.lastResolvedMs = s.now().UnixMilli()
 }
 
-// Flush writes every pending delta and clears it.
+// Flush writes every pending delta, each to its own tenant's store, and clears
+// it.
 //
 // READ-MODIFY-WRITE, not write. The other pod flushes the same row, so a blind
 // write would discard whatever it last contributed. Reading first, and writing
@@ -97,7 +100,7 @@ func (s *Stats) Flush(ctx context.Context) {
 }
 
 func (s *Stats) flushOne(ctx context.Context, tokenHash string, delta *statsEntry) error {
-	current, err := s.records.FetchLinkStats(ctx, tokenHash)
+	current, err := s.records.FetchLinkStats(ctx, delta.tenant, tokenHash)
 	if err != nil {
 		return err
 	}
@@ -118,9 +121,9 @@ func (s *Stats) flushOne(ctx context.Context, tokenHash string, delta *statsEntr
 	// the write is refused (ErrRecordExists, ErrRecordChanged) and the delta is
 	// kept for the next tick, which reads the other pod's flush and adds to it.
 	if current == nil {
-		return s.records.InsertLinkStats(ctx, row)
+		return s.records.InsertLinkStats(ctx, delta.tenant, row)
 	}
-	return s.records.ReplaceLinkStats(ctx, current, row)
+	return s.records.ReplaceLinkStats(ctx, delta.tenant, current, row)
 }
 
 // restore merges a failed delta back into pending, adding to whatever arrived

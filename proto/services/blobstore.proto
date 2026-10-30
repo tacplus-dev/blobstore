@@ -8,11 +8,19 @@
 // WHAT THIS IS. Two pods, each with its own PVC, holding the same
 // content-addressed files. Metadata is stratum records — this service is their
 // only writer (R1) — and the bytes move over two plain HTTP paths the gateway
-// proxies, `PUT /upload/<token>` and `GET|HEAD /b/<token>` (R3). There is no
+// proxies, `PUT /upload/<tid>/<token>` and `GET|HEAD /b/<tid>/<token>` (R3). There is no
 // cloud object store, no NFS, and no signed cloud URL: the "signed URL" is a
 // BEARER TOKEN BY RECORD — raw randomness whose sha256 is the key of the row
 // that holds the grant, so verification is a lookup and revocation is deleting
 // a row (R3, R7). There is no signing key anywhere in this service.
+//
+// THE TENANT IS IN THE PATH (#8). Stratum is tenant_owned: a row lives in its
+// tenant's own instance, and a call reaches the instance of the tenant it names
+// (tacplus-dev/roadmap decisions/tenant-routing-2026-10-26.md). A token is only
+// randomness, so the path names the tenant (`<tid>`, the 8-character id of the
+// namespace /tenants/<tid>) before it. The tid is not a secret and grants
+// nothing; a token presented under another tid is a 404. Rows are kept only in a
+// tenant's namespace: an RPC naming any other namespace is INVALID_ARGUMENT.
 //
 // WHAT THIS IS NOT. A filesystem. Every upload names a VOLUME GROUP declared at
 // build time by the consuming service, and the group is what bounds content
@@ -35,7 +43,7 @@ import "sys/host.proto";
 option (spec.service) = {name: "blobstore"};
 
 // STORED-ROW READS. Every one of this service's own record types is read back:
-// `/b/<token>` resolves a BlobLink and then its Blob, `/upload/<token>` needs
+// `/b/<tid>/<token>` resolves a BlobLink and then its Blob, `/upload/<tid>/<token>` needs
 // the Blob row to know a hash is already promoted, the expiry sweep reads
 // UploadSession, and the metrics rollup reads BlobLinkStats before it adds to
 // it. The grant half of each pair is the record's own `s2s_read` below; neither
@@ -114,8 +122,8 @@ message Config {
   // correct and not a misconfiguration to paper over.
   repeated VolumeGroup volume_groups = 1 [(spec.assert_max_size) = 64];
 
-  // http_listener is the bind address for the BYTE PATHS — `PUT /upload/<t>`
-  // and `GET|HEAD /b/<t>`, and nothing else.
+  // http_listener is the bind address for the BYTE PATHS — `PUT /upload/<tid>/<t>`
+  // and `GET|HEAD /b/<tid>/<t>`, and nothing else.
   //
   // IN-CLUSTER ONLY, exactly like letsencrypt's ACME responder: the gateway
   // owns the edge and proxies these two prefixes here, so this listener needs
@@ -803,12 +811,12 @@ message CreateUploadResponse {
   string upload_id = 1 [(spec.assert_max_size) = 128];
 
   // upload_token is the raw single-use token. The client PUTs to
-  // `/upload/<upload_token>` through the gateway. Returned once and stored
-  // nowhere.
+  // `/upload/<tid>/<upload_token>` through the gateway, tid being the tenant of
+  // the request's namespace. Returned once and stored nowhere.
   string upload_token = 2 [(spec.assert_max_size) = 1024];
 
-  // upload_path is `/upload/<upload_token>` — the path to PUT to, assembled
-  // here so a caller does not hard-code the prefix.
+  // upload_path is `/upload/<tid>/<upload_token>` — the path to PUT to,
+  // assembled here so a caller does not hard-code the prefix or the tenant.
   string upload_path = 3 [(spec.assert_max_size) = 1024];
 
   // expires_ms is when the token stops being accepted.
@@ -867,7 +875,8 @@ message CreateLinkResponse {
   // token is the raw bearer token — 256 random bits, base64url. RETURNED ONCE.
   string token = 1 [(spec.assert_max_size) = 1024];
 
-  // link_path is `/b/<token>`, the path the holder GETs.
+  // link_path is `/b/<tid>/<token>`, the path the holder GETs: tid is the
+  // tenant of the request's namespace, and the token resolves only under it.
   string link_path = 2 [(spec.assert_max_size) = 1024];
 
   // token_hash is the BlobLink key, and what RevokeLink names. Safe to keep:

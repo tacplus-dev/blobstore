@@ -358,7 +358,12 @@ func asChanges[T any, P interface {
 	}, nil
 }
 
-func recordCases() []recordCase {
+func recordCases() []recordCase { return recordCasesFor(testTenant) }
+
+// recordCasesFor is the cases with every call routed to tenant. The rows are
+// testTenant's whatever tenant is, so another tenant's cases are calls routed to
+// the wrong store.
+func recordCasesFor(tenant string) []recordCase {
 	hash := strings.Repeat("ab", 32)
 	tokenHash := strings.Repeat("cd", 32)
 	blob := &blobstore_pb.Blob{
@@ -391,61 +396,61 @@ func recordCases() []recordCase {
 			name: "Blob", row: blob, changed: deletedBlob,
 			// A Blob row is Put, not inserted: see recordStore.PutBlob.
 			insert: func(ctx context.Context, r *recordStore, m proto.Message) error {
-				return r.PutBlob(ctx, m.(*blobstore_pb.Blob))
+				return r.PutBlob(ctx, tenant, m.(*blobstore_pb.Blob))
 			},
 			replace: func(ctx context.Context, r *recordStore, prev, next proto.Message) error {
-				return r.ReplaceBlob(ctx, prev.(*blobstore_pb.Blob), next.(*blobstore_pb.Blob))
+				return r.ReplaceBlob(ctx, tenant, prev.(*blobstore_pb.Blob), next.(*blobstore_pb.Blob))
 			},
 			read: func(ctx context.Context, r *recordStore) (proto.Message, error) {
-				return nilable(r.FetchBlob(ctx, blob.GetBlobId()))
+				return nilable(r.FetchBlob(ctx, tenant, blob.GetBlobId()))
 			},
 			watch: func(ctx context.Context, r *recordStore) (iter.Seq2[RecordChange[proto.Message], error], error) {
-				return asChanges(r.WatchBlobs(ctx))
+				return asChanges(r.WatchBlobs(ctx, tenant))
 			},
 		},
 		{
 			name: "UploadSession", row: session, changed: settled,
 			insert: func(ctx context.Context, r *recordStore, m proto.Message) error {
-				return r.InsertSession(ctx, m.(*blobstore_pb.UploadSession))
+				return r.InsertSession(ctx, tenant, m.(*blobstore_pb.UploadSession))
 			},
 			replace: func(ctx context.Context, r *recordStore, prev, next proto.Message) error {
-				return r.ReplaceSession(ctx, prev.(*blobstore_pb.UploadSession), next.(*blobstore_pb.UploadSession))
+				return r.ReplaceSession(ctx, tenant, prev.(*blobstore_pb.UploadSession), next.(*blobstore_pb.UploadSession))
 			},
 			read: func(ctx context.Context, r *recordStore) (proto.Message, error) {
-				return nilable(r.FetchSession(ctx, tokenHash))
+				return nilable(r.FetchSession(ctx, tenant, tokenHash))
 			},
 			watch: func(ctx context.Context, r *recordStore) (iter.Seq2[RecordChange[proto.Message], error], error) {
-				return asChanges(r.WatchSessions(ctx))
+				return asChanges(r.WatchSessions(ctx, tenant))
 			},
 		},
 		{
 			name: "BlobLink", row: link, changed: revoked,
 			insert: func(ctx context.Context, r *recordStore, m proto.Message) error {
-				return r.InsertLink(ctx, m.(*blobstore_pb.BlobLink))
+				return r.InsertLink(ctx, tenant, m.(*blobstore_pb.BlobLink))
 			},
 			replace: func(ctx context.Context, r *recordStore, prev, next proto.Message) error {
-				return r.ReplaceLink(ctx, prev.(*blobstore_pb.BlobLink), next.(*blobstore_pb.BlobLink))
+				return r.ReplaceLink(ctx, tenant, prev.(*blobstore_pb.BlobLink), next.(*blobstore_pb.BlobLink))
 			},
 			read: func(ctx context.Context, r *recordStore) (proto.Message, error) {
-				return nilable(r.FetchLink(ctx, tokenHash))
+				return nilable(r.FetchLink(ctx, tenant, tokenHash))
 			},
 			watch: func(ctx context.Context, r *recordStore) (iter.Seq2[RecordChange[proto.Message], error], error) {
-				return asChanges(r.WatchLinks(ctx))
+				return asChanges(r.WatchLinks(ctx, tenant))
 			},
 		},
 		{
 			name: "BlobLinkStats", row: stats, changed: more,
 			insert: func(ctx context.Context, r *recordStore, m proto.Message) error {
-				return r.InsertLinkStats(ctx, m.(*blobstore_pb.BlobLinkStats))
+				return r.InsertLinkStats(ctx, tenant, m.(*blobstore_pb.BlobLinkStats))
 			},
 			replace: func(ctx context.Context, r *recordStore, prev, next proto.Message) error {
-				return r.ReplaceLinkStats(ctx, prev.(*blobstore_pb.BlobLinkStats), next.(*blobstore_pb.BlobLinkStats))
+				return r.ReplaceLinkStats(ctx, tenant, prev.(*blobstore_pb.BlobLinkStats), next.(*blobstore_pb.BlobLinkStats))
 			},
 			read: func(ctx context.Context, r *recordStore) (proto.Message, error) {
-				return nilable(r.FetchLinkStats(ctx, tokenHash))
+				return nilable(r.FetchLinkStats(ctx, tenant, tokenHash))
 			},
 			watch: func(ctx context.Context, r *recordStore) (iter.Seq2[RecordChange[proto.Message], error], error) {
-				return asChanges(r.WatchLinkStats(ctx))
+				return asChanges(r.WatchLinkStats(ctx, tenant))
 			},
 		},
 	}
@@ -633,6 +638,9 @@ func TestRecordStoreAnswersMapToTheirErrors(t *testing.T) {
 		{codes.NotFound, ErrRecordNotFound},
 		{codes.Unavailable, ErrRecordStoreUnavailable},
 		{codes.FailedPrecondition, ErrRecordStoreUnavailable},
+		// The store's route check: a call routed to another tenant, or a row
+		// outside the tenant it is routed to (tacplus-dev/tacplus#207).
+		{codes.PermissionDenied, ErrRecordOutsideTenant},
 	} {
 		err := storeError("writing", status.Error(tc.code, "x"))
 		if !errors.Is(err, tc.want) {

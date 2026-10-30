@@ -129,8 +129,8 @@ func TestCreateUploadReportsAlreadyPresent(t *testing.T) {
 	if resp.GetBlobId() != blobIDOf(sess) {
 		t.Errorf("blob_id = %q, want %q", resp.GetBlobId(), blobIDOf(sess))
 	}
-	if resp.GetUploadPath() != PathUpload+resp.GetUploadToken() {
-		t.Error("upload_path must be the /upload/ prefix plus the token")
+	if resp.GetUploadPath() != "/upload/"+testTenant+"/"+resp.GetUploadToken() {
+		t.Errorf("upload_path = %q, want /upload/<tid>/<token>", resp.GetUploadPath())
 	}
 }
 
@@ -155,7 +155,7 @@ func TestAnotherServicesBlobIsNotFound(t *testing.T) {
 	}
 	// And the owner naming another tenant's namespace is refused the same way.
 	if _, err := h.CreateLink(ctx, callerFor("docmanager"), &blobstore_pb.CreateLinkRequest{
-		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: "/tenants/other",
+		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: "/tenants/other001",
 	}); codeOf(err) != codes.NotFound {
 		t.Errorf("CreateLink naming another tenant: got %v, want NotFound", err)
 	}
@@ -176,8 +176,8 @@ func TestCreateLinkReturnsTheTokenOnceAndStoresOnlyItsHash(t *testing.T) {
 	if resp.GetToken() == "" || resp.GetTokenHash() != LinkTokenHash(resp.GetToken()) {
 		t.Fatal("the response must carry the raw token and its matching hash")
 	}
-	if resp.GetLinkPath() != PathBlob+resp.GetToken() {
-		t.Error("link_path must be the /b/ prefix plus the token")
+	if resp.GetLinkPath() != "/b/"+testTenant+"/"+resp.GetToken() {
+		t.Errorf("link_path = %q, want /b/<tid>/<token>", resp.GetLinkPath())
 	}
 	row := p.records.links[resp.GetTokenHash()]
 	if row == nil {

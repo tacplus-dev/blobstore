@@ -112,7 +112,8 @@ func (m *Mirror) Healthy(ctx context.Context) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// ForwardUpload starts a streaming PUT of the same token to the peer and returns
+// ForwardUpload starts a streaming PUT of the same token, under the same tenant
+// (`/peer/upload/<tid>/<token>`), to the peer and returns
 // the writer the caller tees the client's bytes into, plus a function that waits
 // for the peer's verdict.
 //
@@ -126,9 +127,9 @@ func (m *Mirror) Healthy(ctx context.Context) bool {
 // read and makes the peer discard its own temp — the peer never sees a
 // short stream as a complete one, because it checks size and hash like the public
 // path does.
-func (m *Mirror) ForwardUpload(ctx context.Context, token string) (w io.Writer, finish func() error, abort func(), err error) {
+func (m *Mirror) ForwardUpload(ctx context.Context, tenant, token string) (w io.Writer, finish func() error, abort func(), err error) {
 	pr, pw := io.Pipe()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, m.url(PeerPathUpload+token), pr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, m.url(PeerPathUpload+tenant+"/"+token), pr)
 	if err != nil {
 		pr.Close()
 		pw.Close()

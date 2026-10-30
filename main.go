@@ -85,7 +85,11 @@ func run() error {
 	// the only way a row reaches the store (#6).
 	records := internal.NewRecords(s.Grpc().Clients().Vservices().RecordMapClient())
 
-	svc := internal.NewService(store, mirror, records, time.Now)
+	// The sweep walks the tenants kernel reports a Stratum for: each tenant's
+	// sessions are in its own store (#8).
+	tenants := internal.StratumTenants(s.StateClients().Sys().ServiceHealth().Proto)
+
+	svc := internal.NewService(store, mirror, records, tenants, time.Now)
 	handler := internal.NewHandler(svc)
 
 	// The config the generated lifecycle will deliver is the authority, but the

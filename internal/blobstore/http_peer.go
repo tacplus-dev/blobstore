@@ -99,7 +99,7 @@ func (s *Service) servePeerBlob(w http.ResponseWriter, r *http.Request) {
 // PUT owns the record write and is the only one that talks to stratum for this
 // upload; forwarding again would be a loop, and a second write would be a
 // second Blob write for one upload.
-func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, token string) {
+func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, rest string) {
 	if r.Method != http.MethodPut {
 		w.Header().Set("Allow", "PUT")
 		http.Error(w, "", http.StatusMethodNotAllowed)
@@ -111,15 +111,17 @@ func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 
-	// The same lookup the public path makes, against the same row. The hop is not
+	// The same lookup the public path makes, against the same row in the same
+	// tenant's store: the path is the public one's, `<tid>/<token>`. The hop is not
 	// trusted: this pod resolves the token itself rather than believing terms
 	// another pod sent it. The cost is one stratum read per mirrored upload —
 	// which is new, and is what the old self-describing token bought.
-	if token == "" || strings.Contains(token, "/") {
+	tenant, token, ok := bearerPath(rest)
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	session, err := s.records.FetchSession(r.Context(), UploadTokenHash(token))
+	session, err := s.records.FetchSession(r.Context(), tenant, UploadTokenHash(token))
 	if err != nil {
 		http.Error(w, "", http.StatusServiceUnavailable)
 		return

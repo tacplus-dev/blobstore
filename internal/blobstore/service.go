@@ -5,12 +5,15 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/tacplus-dev/blobstore/tacplus/chassis/serviceconnection"
 	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
+	servicehealth_pb "github.com/tacplus-dev/blobstore/tacplus/types/sys/servicehealth"
 	"go.uber.org/zap"
 )
 
@@ -29,6 +32,7 @@ type Service struct {
 	records Records
 	quota   *Quota
 	stats   *Stats
+	tenants Tenants
 	now     func() time.Time
 
 	// cfg is swapped wholesale on every config delivery. An atomic pointer rather
@@ -57,8 +61,8 @@ type runtimeConfig struct {
 
 // NewService builds the service. It does NOT read config: Configure does, and it
 // is called by the generated handler before the server starts and again on every
-// update.
-func NewService(store *Store, mirror *Mirror, records Records, now func() time.Time) *Service {
+// update. tenants is what the sweep walks: see Tenants.
+func NewService(store *Store, mirror *Mirror, records Records, tenants Tenants, now func() time.Time) *Service {
 	if now == nil {
 		now = time.Now
 	}
@@ -68,9 +72,42 @@ func NewService(store *Store, mirror *Mirror, records Records, now func() time.T
 		records: records,
 		quota:   NewQuota(records),
 		stats:   NewStats(records, now),
+		tenants: tenants,
 		now:     now,
 	}
 }
+
+// Tenants lists the tenants whose rows the sweep settles: each has its own
+// Stratum, and nothing reads across them (#8).
+type Tenants func() []string
+
+// StratumTenants is Tenants from kernel: the tenants that kernel's service
+// health reports a Stratum instance for (spiffe_id
+// spiffe://<td>/tenants/<tid>/services/stratum). A tenant with no Stratum up has
+// no store the sweep could reach; its sessions are settled on the first sweep
+// after one comes back.
+func StratumTenants(health func() *servicehealth_pb.ServiceHealth) Tenants {
+	return func() []string {
+		seen := map[string]bool{}
+		var out []string
+		for _, inst := range health().GetInstances() {
+			if inst.GetServiceId() != stratumServiceID {
+				continue
+			}
+			tid, ok := serviceconnection.InstanceTenant(inst.GetSpiffeId())
+			if !ok || seen[tid] {
+				continue
+			}
+			seen[tid] = true
+			out = append(out, tid)
+		}
+		sort.Strings(out)
+		return out
+	}
+}
+
+// stratumServiceID is the record store's service id, as kernel reports it.
+const stratumServiceID = "stratum"
 
 // Configure resolves a delivered Config into the snapshot requests read.
 //
@@ -160,13 +197,23 @@ func (s *Service) RunBackground(ctx context.Context) {
 // reservation and flags the row ABORTED. Temp files are swept at the same time,
 // which is the other half of "start-up sweeps temp files" — a pod that has been
 // up for a week has had crashes too.
+//
+// PER TENANT (#8): each tenant's sessions are in its own Stratum, so the sweep
+// asks each tenant's store for its own, and one tenant whose store cannot be read
+// does not stop the others' sweep.
 func (s *Service) sweepSessions(ctx context.Context) {
 	if err := s.store.SweepTemps(); err != nil {
 		zap.L().Warn("failed to sweep temp files", zap.Error(err))
 	}
-	sessions, err := s.records.ListExpiredSessions(ctx, s.now().UnixMilli())
+	for _, tenant := range s.tenants() {
+		s.sweepTenant(ctx, tenant)
+	}
+}
+
+func (s *Service) sweepTenant(ctx context.Context, tenant string) {
+	sessions, err := s.records.ListExpiredSessions(ctx, tenant, s.now().UnixMilli())
 	if err != nil {
-		zap.L().Warn("failed to list expired upload sessions", zap.Error(err))
+		zap.L().Warn("failed to list expired upload sessions", zap.String("tenant", tenant), zap.Error(err))
 		return
 	}
 	for _, sess := range sessions {
@@ -174,7 +221,7 @@ func (s *Service) sweepSessions(ctx context.Context) {
 			continue
 		}
 		s.quota.Release(sess.GetUploadId(), sess.GetGroup(), sess.GetNamespace())
-		if err := s.settleSession(ctx, sess, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
+		if err := s.settleSession(ctx, tenant, sess, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
 			if errors.Is(err, ErrRecordChanged) {
 				// Settled since the list was read: an upload finished or was
 				// cancelled, on this pod or the other. Nothing is left to sweep.
@@ -194,7 +241,7 @@ func (s *Service) sweepSessions(ctx context.Context) {
 // The replace is conditional on sess being the stored row, so a session settles
 // once: a second settle (the other pod, the sweep, a cancel racing the upload's
 // end) gets ErrRecordChanged rather than overwriting the first one's state.
-func (s *Service) settleSession(ctx context.Context, sess *blobstore_pb.UploadSession, state blobstore_pb.UploadState) error {
+func (s *Service) settleSession(ctx context.Context, tenant string, sess *blobstore_pb.UploadSession, state blobstore_pb.UploadState) error {
 	next := &blobstore_pb.UploadSession{
 		UploadId:       sess.GetUploadId(),
 		Group:          sess.GetGroup(),
@@ -209,7 +256,7 @@ func (s *Service) settleSession(ctx context.Context, sess *blobstore_pb.UploadSe
 		Deleted:        true,
 		Namespace:      sess.GetNamespace(),
 	}
-	return s.records.ReplaceSession(ctx, sess, next)
+	return s.records.ReplaceSession(ctx, tenant, sess, next)
 }
 
 // Store, Mirror and Stats are exposed for the tests that assert on what landed on

@@ -54,8 +54,8 @@ func quotaKey(group, namespace string) string { return group + "\x00" + namespac
 // real usage and the next read of the record store will see them; on release they
 // never existed. Collapsing them into one method would make that distinction
 // impossible to read at the call sites.
-func (q *Quota) Reserve(ctx context.Context, uploadID, group, namespace string, size int64, limit int64) error {
-	used, err := q.usage(ctx, group, namespace)
+func (q *Quota) Reserve(ctx context.Context, tenant, uploadID, group, namespace string, size int64, limit int64) error {
+	used, err := q.usage(ctx, tenant, group, namespace)
 	if err != nil {
 		return err
 	}
@@ -101,8 +101,8 @@ func (q *Quota) drop(uploadID, group, namespace string) {
 // refusing one after a delete freed space — and a stale quota decision is harder
 // to reason about than a slow one. The read is a filtered query on two indexed,
 // EQ-filterable fields and happens once per CreateUpload, not once per byte.
-func (q *Quota) usage(ctx context.Context, group, namespace string) (int64, error) {
-	blobs, err := q.records.ListBlobsInGroup(ctx, group, namespace)
+func (q *Quota) usage(ctx context.Context, tenant, group, namespace string) (int64, error) {
+	blobs, err := q.records.ListBlobsInGroup(ctx, tenant, group, namespace)
 	if err != nil {
 		return 0, fmt.Errorf("reading quota usage for %s/%s: %w", group, namespace, err)
 	}

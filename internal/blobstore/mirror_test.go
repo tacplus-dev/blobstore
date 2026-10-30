@@ -16,7 +16,12 @@ import (
 // Every test in this file is one line of the decision doc's Tests list, in its
 // own words. The harness stands up the real pair; see harness_test.go.
 
-const testNS = "/tenants/acme"
+// testNS is testTenant's namespace: every row of the tests is a tenant's, in
+// that tenant's own store.
+const (
+	testTenant = "acme0001"
+	testNS     = "/tenants/" + testTenant
+)
 
 var pdfBody = []byte("%PDF-1.7\nhello blob store\n")
 
@@ -141,14 +146,15 @@ func TestUploadForAnUnknownGroupIsRefused(t *testing.T) {
 // "dedup within tenant only" — the same bytes under two namespaces are two files.
 func TestDedupIsPerTenant(t *testing.T) {
 	p := newPair(t)
-	const otherNS = "/tenants/other"
+	const otherTenant = "other001"
+	const otherNS = "/tenants/" + otherTenant
 
 	tokenA, sessA := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
 	if got := put(t, p.aBytes, tokenA, pdfBody); got != http.StatusCreated {
 		t.Fatalf("first tenant's upload: got %d, want 201", got)
 	}
 	tokenB, sessB := p.mintUpload(t, p.a, otherNS, "application/pdf", pdfBody)
-	if got := put(t, p.aBytes, tokenB, pdfBody); got != http.StatusCreated {
+	if got := putPath(t, p.aBytes, UploadPath(otherTenant, tokenB), pdfBody); got != http.StatusCreated {
 		t.Fatalf("second tenant's upload: got %d, want 201", got)
 	}
 
