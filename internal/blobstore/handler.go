@@ -134,12 +134,12 @@ func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Calle
 		OwnerPrincipal: owner,
 		Namespace:      req.GetNamespace(),
 	}
-	if err := h.svc.records.PublishSession(ctx, session); err != nil {
+	if err := h.svc.records.InsertSession(ctx, session); err != nil {
 		release()
 		// Fail closed on stratum (R11). A token handed out without a durable
 		// session is now worse than a reservation nothing can release: the row IS
 		// the grant, so the token would never be accepted by anything.
-		return nil, status.Error(codes.Unavailable, err.Error())
+		return nil, recordWriteStatus(err)
 	}
 
 	key := BlobKey{Group: req.GetGroup(), Namespace: req.GetNamespace(), Hash: req.GetContentHash()}
@@ -184,7 +184,13 @@ func (h *Handler) CancelUpload(ctx context.Context, caller *servicemanager.Calle
 	}
 	h.svc.quota.Release(session.GetUploadId(), session.GetGroup(), session.GetNamespace())
 	if err := h.svc.settleSession(ctx, session, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		if errors.Is(err, ErrRecordChanged) {
+			// Settled underneath this call — the upload finished, or the sweep or
+			// another cancel got there first. Either way it is no longer this
+			// call's to cancel, which is the idempotent answer.
+			return &blobstore_pb.CancelUploadResponse{Cancelled: false}, nil
+		}
+		return nil, recordWriteStatus(err)
 	}
 	return &blobstore_pb.CancelUploadResponse{Cancelled: true}, nil
 }
@@ -221,8 +227,8 @@ func (h *Handler) CreateLink(ctx context.Context, caller *servicemanager.Caller,
 		OwnerPrincipal: owner,
 		Namespace:      req.GetNamespace(),
 	}
-	if err := h.svc.records.PublishLink(ctx, link); err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+	if err := h.svc.records.InsertLink(ctx, link); err != nil {
+		return nil, recordWriteStatus(err)
 	}
 	return &blobstore_pb.CreateLinkResponse{
 		Token:     token,
@@ -262,8 +268,8 @@ func (h *Handler) CreateBlobUrl(ctx context.Context, caller *servicemanager.Call
 		OwnerPrincipal: owner,
 		Namespace:      req.GetNamespace(),
 	}
-	if err := h.svc.records.PublishLink(ctx, link); err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+	if err := h.svc.records.InsertLink(ctx, link); err != nil {
+		return nil, recordWriteStatus(err)
 	}
 	return &blobstore_pb.CreateBlobUrlResponse{
 		Token:     token,
@@ -296,8 +302,8 @@ func (h *Handler) RevokeLink(ctx context.Context, caller *servicemanager.Caller,
 	revokedMs := h.svc.now().UnixMilli()
 	next := cloneLink(link)
 	next.RevokedMs = revokedMs
-	if err := h.svc.records.PublishLink(ctx, next); err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+	if err := h.svc.records.ReplaceLink(ctx, link, next); err != nil {
+		return nil, recordWriteStatus(err)
 	}
 	return &blobstore_pb.RevokeLinkResponse{Revoked: true, RevokedMs: revokedMs}, nil
 }
@@ -397,8 +403,8 @@ func (h *Handler) DeleteBlob(ctx context.Context, caller *servicemanager.Caller,
 	}
 	next := cloneBlob(blob)
 	next.Deleted = true
-	if err := h.svc.records.PublishBlob(ctx, next); err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+	if err := h.svc.records.ReplaceBlob(ctx, blob, next); err != nil {
+		return nil, recordWriteStatus(err)
 	}
 	return &blobstore_pb.DeleteBlobResponse{Deleted: true}, nil
 }
@@ -441,6 +447,26 @@ func (h *Handler) GetLinkStats(ctx context.Context, caller *servicemanager.Calle
 		OwnerPrincipal: link.GetOwnerPrincipal(),
 		Namespace:      link.GetNamespace(),
 	}, nil
+}
+
+// recordWriteStatus is a refused record write as the RPC's answer.
+//
+// Fail closed (R11): a store that could not take the write is UNAVAILABLE, worth
+// retrying. A row that changed between this call's read and its write is ABORTED:
+// the caller retries the whole call, which reads the row afresh. A replaced row
+// that is gone (purged) is NOT_FOUND. An insert of a key that exists cannot happen
+// to a key minted from 256 random bits, so it is INTERNAL.
+func recordWriteStatus(err error) error {
+	switch {
+	case errors.Is(err, ErrRecordChanged):
+		return status.Error(codes.Aborted, err.Error())
+	case errors.Is(err, ErrRecordNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, ErrRecordExists):
+		return status.Error(codes.Internal, err.Error())
+	default:
+		return status.Error(codes.Unavailable, err.Error())
+	}
 }
 
 // ownedBlob reads a blob and refuses it unless the caller owns it and it is live.

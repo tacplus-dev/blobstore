@@ -38,7 +38,7 @@ type Stats struct {
 
 // statsEntry is one token's unflushed delta plus the identity the row needs. The
 // owner and namespace are carried because a flush may be the row's FIRST write
-// and a record cannot be published without them.
+// and a record cannot be written without them.
 type statsEntry struct {
 	ownerPrincipal string
 	namespace      string
@@ -72,10 +72,11 @@ func (s *Stats) Record(tokenHash, ownerPrincipal, namespace string, bytesServed 
 // Flush writes every pending delta and clears it.
 //
 // READ-MODIFY-WRITE, not write. The other pod flushes the same row, so a blind
-// write would discard whatever it last contributed. Reading first means a flush
-// can only ever move the counters forward — it cannot make the row the SUM at any
-// instant (nothing could, for an in-memory counter on two pods), but it never
-// loses the other pod's work.
+// write would discard whatever it last contributed. Reading first, and writing
+// only if the row is still what was read, means a flush can only ever move the
+// counters forward — it cannot make the row the SUM at any instant (nothing
+// could, for an in-memory counter on two pods), but it never loses the other
+// pod's work, even when the two flush at once.
 //
 // A delta whose flush fails is PUT BACK, so a stratum blip costs a delay rather
 // than a count. The one thing it does not do is retry inside the flush: the next
@@ -113,7 +114,13 @@ func (s *Stats) flushOne(ctx context.Context, tokenHash string, delta *statsEntr
 	if current.GetLastResolvedMs() > row.LastResolvedMs {
 		row.LastResolvedMs = current.GetLastResolvedMs()
 	}
-	return s.records.PublishLinkStats(ctx, row)
+	// Conditional on the row read above: if the other pod flushed in between,
+	// the write is refused (ErrRecordExists, ErrRecordChanged) and the delta is
+	// kept for the next tick, which reads the other pod's flush and adds to it.
+	if current == nil {
+		return s.records.InsertLinkStats(ctx, row)
+	}
+	return s.records.ReplaceLinkStats(ctx, current, row)
 }
 
 // restore merges a failed delta back into pending, adding to whatever arrived

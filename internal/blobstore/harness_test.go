@@ -15,6 +15,7 @@ import (
 	"time"
 
 	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
+	"google.golang.org/protobuf/proto"
 )
 
 // The harness stands up the REAL pair: two Services, each with its own temp
@@ -193,10 +194,12 @@ func put(t *testing.T, srv *httptest.Server, token string, body []byte) int {
 // fakeRecords — stratum, in memory
 // ---------------------------------------------------------------------------
 
-// fakeRecords is the only stub in the harness. It behaves the way the real record
-// plane behaves in the two ways the code depends on: a publish REPLACES the row
-// with that key (a record's write path is a republish on its bus), and a missing
-// row reads as (nil, nil) rather than as an error.
+// fakeRecords is the only stub in the harness. It answers the way recordStore
+// does over stratum's write surface: an insert of a stored key is
+// ErrRecordExists, a replace of a row that changed since it was read is
+// ErrRecordChanged, a Put replaces whatever is stored, and a missing row reads
+// as (nil, nil) rather than as an error. records_test.go tests recordStore
+// itself against a fake of stratum's gRPC surface.
 type fakeRecords struct {
 	mu       sync.Mutex
 	blobs    map[string]*blobstore_pb.Blob
@@ -206,8 +209,23 @@ type fakeRecords struct {
 
 	// failReads makes every read return an error, for the fail-closed tests (R11).
 	failReads bool
-	// failPublish makes every publish return an error.
-	failPublish bool
+	// failWrites makes every write refused as stratum refuses them while the
+	// redo service is unreachable.
+	failWrites bool
+	// beforeWrite, when set, runs once before the next write takes the lock: it
+	// is how a test makes another writer get there between a read and a write.
+	beforeWrite func()
+}
+
+// interleave runs and clears beforeWrite.
+func (f *fakeRecords) interleave() {
+	f.mu.Lock()
+	hook := f.beforeWrite
+	f.beforeWrite = nil
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 }
 
 func newFakeRecords() *fakeRecords {
@@ -219,7 +237,10 @@ func newFakeRecords() *fakeRecords {
 	}
 }
 
-var errFakeStratum = fmt.Errorf("fake stratum is unreachable")
+var (
+	errFakeStratum       = fmt.Errorf("fake stratum is unreachable")
+	errFakeStratumWrites = fmt.Errorf("fake stratum: redo is unreachable: %w", ErrRecordStoreUnavailable)
+)
 
 func (f *fakeRecords) putSession(s *blobstore_pb.UploadSession) {
 	f.mu.Lock()
@@ -311,43 +332,91 @@ func (f *fakeRecords) FetchLinkStats(_ context.Context, tokenHash string) (*blob
 	return f.stats[tokenHash], nil
 }
 
-func (f *fakeRecords) PublishBlob(_ context.Context, rec *blobstore_pb.Blob) error {
+func (f *fakeRecords) PutBlob(_ context.Context, rec *blobstore_pb.Blob) error {
+	f.interleave()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.failPublish {
-		return errFakeStratum
+	if f.failWrites {
+		return errFakeStratumWrites
 	}
 	f.blobs[rec.GetBlobId()] = rec
 	return nil
 }
 
-func (f *fakeRecords) PublishSession(_ context.Context, rec *blobstore_pb.UploadSession) error {
+func (f *fakeRecords) ReplaceBlob(_ context.Context, prev, next *blobstore_pb.Blob) error {
+	f.interleave()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.failPublish {
-		return errFakeStratum
+	return fakeReplace(f.failWrites, f.blobs, next.GetBlobId(), prev, next)
+}
+
+func (f *fakeRecords) InsertSession(_ context.Context, rec *blobstore_pb.UploadSession) error {
+	f.interleave()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fakeInsert(f.failWrites, f.sessions, rec.GetUploadId(), rec)
+}
+
+func (f *fakeRecords) ReplaceSession(_ context.Context, prev, next *blobstore_pb.UploadSession) error {
+	f.interleave()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fakeReplace(f.failWrites, f.sessions, next.GetUploadId(), prev, next)
+}
+
+func (f *fakeRecords) InsertLink(_ context.Context, rec *blobstore_pb.BlobLink) error {
+	f.interleave()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fakeInsert(f.failWrites, f.links, rec.GetTokenHash(), rec)
+}
+
+func (f *fakeRecords) ReplaceLink(_ context.Context, prev, next *blobstore_pb.BlobLink) error {
+	f.interleave()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fakeReplace(f.failWrites, f.links, next.GetTokenHash(), prev, next)
+}
+
+func (f *fakeRecords) InsertLinkStats(_ context.Context, rec *blobstore_pb.BlobLinkStats) error {
+	f.interleave()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fakeInsert(f.failWrites, f.stats, rec.GetTokenHash(), rec)
+}
+
+func (f *fakeRecords) ReplaceLinkStats(_ context.Context, prev, next *blobstore_pb.BlobLinkStats) error {
+	f.interleave()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fakeReplace(f.failWrites, f.stats, next.GetTokenHash(), prev, next)
+}
+
+// fakeInsert and fakeReplace answer as stratum's InsertIfAbsent and
+// ReplaceIfUnchanged (against the expected row) do.
+func fakeInsert[T proto.Message](fail bool, rows map[string]T, key string, rec T) error {
+	if fail {
+		return errFakeStratumWrites
 	}
-	f.sessions[rec.GetUploadId()] = rec
+	if _, ok := rows[key]; ok {
+		return ErrRecordExists
+	}
+	rows[key] = rec
 	return nil
 }
 
-func (f *fakeRecords) PublishLink(_ context.Context, rec *blobstore_pb.BlobLink) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.failPublish {
-		return errFakeStratum
+func fakeReplace[T proto.Message](fail bool, rows map[string]T, key string, prev, next T) error {
+	if fail {
+		return errFakeStratumWrites
 	}
-	f.links[rec.GetTokenHash()] = rec
-	return nil
-}
-
-func (f *fakeRecords) PublishLinkStats(_ context.Context, rec *blobstore_pb.BlobLinkStats) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.failPublish {
-		return errFakeStratum
+	stored, ok := rows[key]
+	if !ok {
+		return ErrRecordNotFound
 	}
-	f.stats[rec.GetTokenHash()] = rec
+	if !proto.Equal(stored, prev) {
+		return ErrRecordChanged
+	}
+	rows[key] = next
 	return nil
 }
 

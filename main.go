@@ -4,8 +4,7 @@
 //
 // WHY GO. Two reasons, both about matching what the fleet already does:
 // letsencrypt is the fleet's existing example of exactly this shape — a Go
-// service that reads a stratum record back, publishes onto the record's topic,
-// and runs a plain HTTP listener beside the generated s2s surface — and the
+// service that keeps its records in stratum and runs a plain HTTP listener beside the generated s2s surface — and the
 // operator, the other piece this work touches, is Go too. The byte paths also
 // want nothing but the standard library: streaming bodies, SHA-256 on the stream,
 // fsync of a file and of its directory, and an atomic rename are all stdlib in Go,
@@ -82,13 +81,9 @@ func run() error {
 	zap.L().Info("blobstore mirror",
 		zap.String("self", self), zap.String("peer", mirror.Peer()), zap.String("data_dir", store.Root()))
 
-	records := internal.NewRecords(
-		s.Grpc().Clients().Vservices().RecordMapClient(),
-		s.CreateBlobstoreBlobBusStreamPublisher(),
-		s.CreateBlobstoreUploadSessionBusStreamPublisher(),
-		s.CreateBlobstoreBlobLinkBusStreamPublisher(),
-		s.CreateBlobstoreBlobLinkStatsBusStreamPublisher(),
-	)
+	// Reads and writes alike go to stratum's record plane: its write surface is
+	// the only way a row reaches the store (#6).
+	records := internal.NewRecords(s.Grpc().Clients().Vservices().RecordMapClient())
 
 	svc := internal.NewService(store, mirror, records, time.Now)
 	handler := internal.NewHandler(svc)

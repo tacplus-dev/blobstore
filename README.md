@@ -38,7 +38,7 @@ No group, no upload.
 | `internal/blobstore/mirror.go` | the peer: health, upload forwarding, delete, anti-entropy |
 | `internal/blobstore/http_bytes.go` | `PUT /upload/<token>`, `GET|HEAD /b/<token>` |
 | `internal/blobstore/http_peer.go` | `/peer/*` — the mirror sink and the anti-entropy source |
-| `internal/blobstore/records.go` | stratum: the record reads and the four publishers |
+| `internal/blobstore/records.go` | stratum: the record reads and writes, through its record plane |
 | `internal/blobstore/quota.go` | per-tenant, per-group quota and its reservations |
 | `internal/blobstore/stats.go` | in-memory resolution counters and the rollup |
 | `internal/blobstore/handler.go` | the RPC surface and the generated lifecycle |

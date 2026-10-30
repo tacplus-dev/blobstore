@@ -104,17 +104,10 @@ message VolumeGroup {
 message Config {
   option (spec.grpc_config) = {service_name: "blobstore"};
 
-  // The four topics tacplus SYNTHESIZES from the records below — this service's
-  // durable write path. A record has no write RPC: it reaches stratum on
-  // stratum's own subscription to the topic, so publishing here IS writing the
-  // record. Same shape as letsencrypt's and mailbox's: no method_s2s, because
-  // the producer surface is declared on each record itself (s2s:
-  // ["blobstore"]) and the generator folds it in — restating it could only
-  // drift.
-  option (spec.event_publish) = {topic_ref: "blobstore.BlobBus.stream"};
-  option (spec.event_publish) = {topic_ref: "blobstore.UploadSessionBus.stream"};
-  option (spec.event_publish) = {topic_ref: "blobstore.BlobLinkBus.stream"};
-  option (spec.event_publish) = {topic_ref: "blobstore.BlobLinkStatsBus.stream"};
+  // NO RECORD TOPIC IS PUBLISHED. The records below are written through
+  // stratum's generated write surface (s2s_write on each), and stratum takes
+  // rows no other way: it declares no_bus_ingest, so a record published on its
+  // topic would reach no store at all (#6).
 
   // volume_groups is every group declared anywhere in the fleet, rendered by
   // the operator. See VolumeGroup: empty means no upload is possible, which is
@@ -213,15 +206,22 @@ message Blob {
     owner: "spiffe_id"
 
     // PRODUCER surface: blobstore is the only writer of every record in this
-    // file (R1). Nothing else may assert that a blob exists.
+    // file (R1). Nothing else may assert that a blob exists. A record still
+    // declares one, but nothing publishes on its topic: see Config.
     s2s: {auth_services: ["blobstore"]}
 
-    // CONSUMER surface: stratum, the record store, and nobody else. stratum
-    // auto-derives a subscription to every (spec.record) topic, so omitting it
-    // denies the store the topic it exists to read.
-    s2s_subscribe: {auth_services: ["stratum"]}
+    // WRITE: stratum's generated write surface (InsertIfAbsent, Put,
+    // ReplaceIfUnchanged, Apply), the only way a row reaches the store. The
+    // answer is final: written at the type's durability (unset, so LOCAL: on
+    // the redo's disk), or refused with the reason.
+    s2s_write: {auth_services: ["blobstore"]}
 
-    // STORED-ROW READ: see the file-level (spec.record_read) block.
+    // CHANGE FEED: who may Watch<T>Changes, the store's feed of acked writes.
+    // stratum no longer reads a topic (no_bus_ingest), so it is not named.
+    s2s_subscribe: {auth_services: ["blobstore"]}
+
+    // STORED-ROW READ (Get<T> and the query plane): see the file-level
+    // (spec.record_read) block.
     s2s_read: {auth_services: ["blobstore"]}
 
     // NOT `private`. The owner here is a SERVICE, and `private` refuses the s2s
@@ -294,7 +294,7 @@ message Blob {
   // — and the row's owning principal (R6). Only this identity creates or
   // revokes links or deletes the blob.
   //
-  // `spiffe_id` below is the record's declared owner but is the PUBLISHER,
+  // `spiffe_id` below is the record's declared owner but is the WRITER,
   // which is always blobstore, so it is the wrong field to filter an owner's
   // reads on — the same split mailbox.MailboxEntry makes between `recipient`
   // and `spiffe_id`.
@@ -310,7 +310,7 @@ message Blob {
   // flag is what stops a resolve and starts the purge clock.
   bool deleted = 8 [(spec.deleted_flag) = true];
 
-  // spiffe_id is the record's owner in the store's sense — the publisher, which
+  // spiffe_id is the record's owner in the store's sense — the writer, which
   // is blobstore's own workload identity. See owner_principal.
   string spiffe_id = 9 [
     (spec.identity_spiffe_subject) = true,
@@ -336,7 +336,7 @@ enum UploadState {
   // promoted.
   UPLOAD_STATE_PENDING = 1;
   // COMMITTED: the bytes are fsynced and renamed on both pods and the Blob row
-  // is published. The reservation became real usage.
+  // is written. The reservation became real usage.
   UPLOAD_STATE_COMMITTED = 2;
   // ABORTED: CancelUpload, an expiry sweep, or a failed PUT. Temps are gone
   // from both pods and the reservation is released.
@@ -352,11 +352,10 @@ enum UploadState {
 // the shape BlobLink gives a `/b/` token (R3, R7); there is no signing key and
 // nothing to rotate.
 //
-// THE COST, STATED: a record reaches stratum on an eventbus publish, which is
-// enqueue-and-retry, so a PUT arriving milliseconds after CreateUpload returned
-// can find this row missing and be refused. BlobLink has had exactly that race
-// since it was written and it is accepted there for the same reason — a caller
-// that just asked for the token retries.
+// The row is written with InsertIfAbsent before CreateUpload answers, and the
+// write is synchronous, so a PUT that follows the answer finds it. (When records
+// reached stratum on an eventbus publish, a PUT milliseconds after CreateUpload
+// could find the row missing; BlobLink had the same race.)
 //
 // This row is ALSO the quota reservation, the expiry sweep that releases it, the
 // single-use ledger (state leaves PENDING once), and the answer to "what was
@@ -366,7 +365,8 @@ message UploadSession {
     key: "upload_id"
     owner: "spiffe_id"
     s2s: {auth_services: ["blobstore"]}
-    s2s_subscribe: {auth_services: ["stratum"]}
+    s2s_write: {auth_services: ["blobstore"]}
+    s2s_subscribe: {auth_services: ["blobstore"]}
     s2s_read: {auth_services: ["blobstore"]}
 
     // idle_seconds 3600 — an hour, comfortably past the 15-minute token TTL and
@@ -481,7 +481,8 @@ message BlobLink {
     key: "token_hash"
     owner: "spiffe_id"
     s2s: {auth_services: ["blobstore"]}
-    s2s_subscribe: {auth_services: ["stratum"]}
+    s2s_write: {auth_services: ["blobstore"]}
+    s2s_subscribe: {auth_services: ["blobstore"]}
     s2s_read: {auth_services: ["blobstore"]}
 
     // idle_seconds 604800 — a week, matching Blob: a link is read on every
@@ -576,7 +577,8 @@ message BlobLinkStats {
     key: "token_hash"
     owner: "spiffe_id"
     s2s: {auth_services: ["blobstore"]}
-    s2s_subscribe: {auth_services: ["stratum"]}
+    s2s_write: {auth_services: ["blobstore"]}
+    s2s_subscribe: {auth_services: ["blobstore"]}
     s2s_read: {auth_services: ["blobstore"]}
 
     // idle_seconds 604800 — a week, with BlobLink: a stats row is touched on

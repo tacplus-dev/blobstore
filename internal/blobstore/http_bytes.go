@@ -237,15 +237,16 @@ func (s *Service) serveUpload(w http.ResponseWriter, r *http.Request, token stri
 }
 
 // receiveAndPromote is the upload's body: tee to the peer and the local temp file,
-// check everything, promote on the peer first and locally second, then publish.
+// check everything, promote on the peer first and locally second, then write the
+// Blob row.
 //
 // THE PROMOTION ORDER IS THE WRITE RULE. The peer renames into place before it
 // answers, so by the time this pod renames, both pods have the bytes fsynced — and
-// the Blob record is published after both, so a record never points at bytes that
+// the Blob record is written after both, so a record never points at bytes that
 // are not on both pods (R9). The reverse order would make a window where this pod
-// has a promoted file and a published record and the peer has nothing.
+// has a promoted file and a written record and the peer has nothing.
 //
-// If the peer promoted and this pod then failed, no record is published and the
+// If the peer promoted and this pod then failed, no record is written and the
 // peer keeps a file nothing points at. That is harmless by construction: the file
 // is named by its own hash, so a retry writes the identical bytes and the peer's
 // copy is a dedup rather than a conflict.
@@ -315,11 +316,11 @@ func (s *Service) receiveAndPromote(
 		OwnerPrincipal: session.GetOwnerPrincipal(),
 		Namespace:      session.GetNamespace(),
 	}
-	if err := s.records.PublishBlob(r.Context(), blob); err != nil {
+	if err := s.records.PutBlob(r.Context(), blob); err != nil {
 		// The bytes are on both pods and the record is not. Fail the upload: the
 		// caller must not believe it has a blob it cannot find. The bytes stay,
-		// and a retry of the same content promotes to the same path and publishes
-		// again.
+		// and a retry of the same content promotes to the same path and writes
+		// the row again.
 		return "", http.StatusServiceUnavailable, err
 	}
 

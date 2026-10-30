@@ -95,10 +95,10 @@ func (s *Service) servePeerBlob(w http.ResponseWriter, r *http.Request) {
 // servePeerUpload is the mirror sink: receive the forwarded stream, run the SAME
 // checks the public path runs, and promote.
 //
-// IT PUBLISHES NOTHING AND FORWARDS NOTHING. The pod that received the client's
+// IT WRITES NO RECORD AND FORWARDS NOTHING. The pod that received the client's
 // PUT owns the record write and is the only one that talks to stratum for this
-// upload; forwarding again would be a loop, and a second publish would be a
-// second Blob row for one upload.
+// upload; forwarding again would be a loop, and a second write would be a
+// second Blob write for one upload.
 func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, token string) {
 	if r.Method != http.MethodPut {
 		w.Header().Set("Allow", "PUT")

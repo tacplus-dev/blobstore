@@ -2,6 +2,7 @@ package blobstore
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"strings"
@@ -174,16 +175,25 @@ func (s *Service) sweepSessions(ctx context.Context) {
 		}
 		s.quota.Release(sess.GetUploadId(), sess.GetGroup(), sess.GetNamespace())
 		if err := s.settleSession(ctx, sess, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
+			if errors.Is(err, ErrRecordChanged) {
+				// Settled since the list was read: an upload finished or was
+				// cancelled, on this pod or the other. Nothing is left to sweep.
+				continue
+			}
 			zap.L().Warn("failed to settle expired upload session",
 				zap.String("upload_id", sess.GetUploadId()), zap.Error(err))
 		}
 	}
 }
 
-// settleSession republishes a session row in a terminal state. The row is flagged
-// deleted at the same time: the purge clock
+// settleSession replaces a session row with its terminal state. The row is
+// flagged deleted at the same time: the purge clock
 // (residency.deleted_max_age_seconds) is what keeps the reservation ledger
 // bounded, and a settled session has no reader left.
+//
+// The replace is conditional on sess being the stored row, so a session settles
+// once: a second settle (the other pod, the sweep, a cancel racing the upload's
+// end) gets ErrRecordChanged rather than overwriting the first one's state.
 func (s *Service) settleSession(ctx context.Context, sess *blobstore_pb.UploadSession, state blobstore_pb.UploadState) error {
 	next := &blobstore_pb.UploadSession{
 		UploadId:       sess.GetUploadId(),
@@ -199,7 +209,7 @@ func (s *Service) settleSession(ctx context.Context, sess *blobstore_pb.UploadSe
 		Deleted:        true,
 		Namespace:      sess.GetNamespace(),
 	}
-	return s.records.PublishSession(ctx, next)
+	return s.records.ReplaceSession(ctx, sess, next)
 }
 
 // Store, Mirror and Stats are exposed for the tests that assert on what landed on
