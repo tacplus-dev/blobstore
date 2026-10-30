@@ -7,3 +7,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-10-29 looper issue Work without SeaBeam: no gitlab.com/seabeam module paths, sources or registries (#3, edc8e57)
 - 2026-10-29 looper issue Patch vulnerable gRPC and golang.org/x dependencies (grpc 1.79.1 → ≥1.83.2, x/net, x/text, x/sys) (#4, efa527c)
 - 2026-10-29 looper issue Dockerfile: base image is SeaBeam's private schematic-alpine-1-2:latest, not the latest Alpine line (3.24) (#5, 4a1ded4)
+- 2026-10-30 looper issue Write records to Stratum through its write surface: Stratum no longer ingests them from the event bus (#6, 33817fc)
