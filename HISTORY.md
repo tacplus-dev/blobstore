@@ -9,3 +9,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-10-29 looper issue Dockerfile: base image is SeaBeam's private schematic-alpine-1-2:latest, not the latest Alpine line (3.24) (#5, 4a1ded4)
 - 2026-10-30 looper issue Write records to Stratum through its write surface: Stratum no longer ingests them from the event bus (#6, 33817fc)
 - 2026-11-01 looper issue Blobstore is tenant-owned: one instance per tenant, own disks and Stratum; no /system dependency (supersedes #8) (#9, 9c3d06a)
+- 2026-11-01 looper issue Peers in Config, not env (uni-config, operator#17) (#10, 2adcee7)
