@@ -7,7 +7,7 @@ The platform's binary blob primitive: a two-pod mirror of content-addressed file
 Ported from schematic 2026-10-23. Unreleased; tacplus floor 2.4 (declared in tacplus.yaml; #1 still open). Not yet in seatrials.
 
 ## Next
-- Nothing unblocked; see Later.
+- Tenant-owned blobstore: one instance per tenant with its own disks and Stratum; no /system dependency; supersedes #8 (#9) (Jody, 2026-11-01)
 
 ## Later
 - Declare the tacplus floor 2.4 (#1), blocked by tacplus-dev/tacplus#188
