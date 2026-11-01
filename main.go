@@ -83,7 +83,7 @@ func run() error {
 		return err
 	}
 	self := internal.SelfHostname()
-	mirror, err := internal.NewMirror(internal.PeersFromEnvOrConfig(cfg), self, nil)
+	mirror, err := internal.MirrorFromConfig(cfg, self, nil)
 	if err != nil {
 		return err
 	}

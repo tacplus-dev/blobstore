@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -260,28 +259,13 @@ func SelfHostname() string {
 	return h
 }
 
-// PeersFromEnvOrConfig returns the peer list, preferring BLOBSTORE_PEERS.
-//
-// The env var is the operator's delivery path — the same shape stratum's
-// STRATUM_SEED_MEMBERS uses, because peer wiring is deployment topology the
-// operator already knows. Config.peers is the local-run and test path. Two
-// sources with a stated precedence, rather than a merge: a merge of two topology
-// lists is a topology neither side declared.
-func PeersFromEnvOrConfig(cfg *blobstore_pb.Config) []string {
-	if env := os.Getenv("BLOBSTORE_PEERS"); env != "" {
-		return splitPeers(env)
-	}
-	return cfg.GetPeers()
-}
-
-func splitPeers(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+// MirrorFromConfig builds this pod's mirror from Config.peers, the only source
+// of the pair's wiring: the operator renders it into the typed Config (the
+// uni-config, operator#17; #10), not into the environment. Peer wiring is
+// deployment topology the operator knows, and one typed path for it is what
+// keeps two sources from disagreeing.
+func MirrorFromConfig(cfg *blobstore_pb.Config, self string, client *http.Client) (*Mirror, error) {
+	return NewMirror(cfg.GetPeers(), self, client)
 }
 
 // httpClientForPeer is the client the mirror uses.

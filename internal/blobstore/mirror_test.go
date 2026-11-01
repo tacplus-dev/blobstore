@@ -291,3 +291,23 @@ func assertNoTemps(t *testing.T, pod string, svc *Service) {
 func blobIDOf(sess *blobstore_pb.UploadSession) string {
 	return BlobKey{Group: sess.GetGroup(), Hash: sess.GetContentHash()}.String()
 }
+
+// Peers in Config, not env (#10, operator#17): the pair is wired only by
+// Config.peers. A BLOBSTORE_PEERS left in the environment is not read at all,
+// so it can neither override the config nor stand in for an empty one.
+func TestPeersComeOnlyFromConfig(t *testing.T) {
+	t.Setenv("BLOBSTORE_PEERS", "blobstore-0.blobstore:8081,blobstore-9.blobstore:8081")
+	cfg := &blobstore_pb.Config{Peers: []string{"blobstore-0.blobstore:8081", "blobstore-1.blobstore:8081"}}
+
+	m, err := MirrorFromConfig(cfg, "blobstore-0", nil)
+	if err != nil {
+		t.Fatalf("MirrorFromConfig: %v", err)
+	}
+	if got, want := m.Peer(), "blobstore-1.blobstore:8081"; got != want {
+		t.Fatalf("peer = %q, want %q (from Config.peers, not the env)", got, want)
+	}
+
+	if _, err := MirrorFromConfig(&blobstore_pb.Config{}, "blobstore-0", nil); err == nil {
+		t.Fatal("a Config without peers built a mirror: the env must not stand in for it")
+	}
+}

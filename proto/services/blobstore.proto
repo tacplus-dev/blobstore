@@ -155,10 +155,10 @@ message Config {
   // itself by matching its hostname against the first DNS label and treats the
   // rest as peers.
   //
-  // Delivered by the operator as BLOBSTORE_PEERS, the same env shape as
-  // stratum's STRATUM_SEED_MEMBERS — peer wiring is deployment topology the
-  // operator already knows, and inventing a second typed path for it would
-  // only let the two disagree.
+  // Rendered by the operator into this typed Config (the uni-config,
+  // operator#17), the only path for it: no env var is read (#10). Peer wiring
+  // is deployment topology the operator already knows, and a second path for
+  // it would only let the two disagree.
   repeated string peers = 4 [(spec.assert_max_size) = 8, (spec.assert_element_max_size) = 253];
 
   // data_dir is the PVC mount holding `<group>/<sha256>` and the `tmp`
