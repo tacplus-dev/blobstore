@@ -37,17 +37,18 @@ import (
 // did not reach stratum is bytes nobody can find, which is worse than a refused
 // upload.
 //
-// EVERY CALL NAMES ITS TENANT (#8). Stratum is tenant_owned: each tenant has its
+// EVERY CALL NAMES ITS TENANT. Stratum is tenant_owned: each tenant has its
 // own instance, and a row lives in the instance of the tenant its namespace
-// belongs to (/tenants/<tid>). tenant is that tid, and it is the only thing that
-// decides which instance a call reaches. The RPCs take it from the request's
-// namespace, the byte paths from the path (/b/<tid>/<token>), and the sweep from
-// the tenants kernel reports a Stratum for.
+// belongs to (/tenants/<tid>). tenant is that tid, sent as the plane's
+// target_tenant, and it is the only thing that decides which instance a call
+// reaches. blobstore is tenant_owned too (#9): an instance serves one tenant and
+// names only that tenant, so every call is a same-tenant call to its own
+// tenant's Stratum.
 type Records interface {
 	FetchBlob(ctx context.Context, tenant, blobID string) (*blobstore_pb.Blob, error)
-	// ListBlobsInGroup returns every non-deleted blob for one tenant in one
-	// group. It is the quota reader; see Quota.
-	ListBlobsInGroup(ctx context.Context, tenant, group, namespace string) ([]*blobstore_pb.Blob, error)
+	// ListBlobsInGroup returns every blob row of one group in the tenant's
+	// store. It is the quota reader; see Quota.
+	ListBlobsInGroup(ctx context.Context, tenant, group string) ([]*blobstore_pb.Blob, error)
 	FetchLink(ctx context.Context, tenant, tokenHash string) (*blobstore_pb.BlobLink, error)
 	ListLinksForBlob(ctx context.Context, tenant, blobID, namespace string) ([]*blobstore_pb.BlobLink, error)
 	FetchSession(ctx context.Context, tenant, uploadID string) (*blobstore_pb.UploadSession, error)
@@ -137,14 +138,13 @@ const recordPageSize = 100
 // recordStore is Records over the generated plane. Nothing here speaks to
 // stratum directly.
 //
-// THE TENANT IS CHECKED HERE ON BOTH SIDES OF A CALL. A call that names no tid is
-// refused before it is sent; a write of a row outside /tenants/<tenant> is
-// refused before it is sent; and a row read back that is not the tenant's is
-// treated as absent (a list or a watch drops it), which is what that tenant's
-// own Stratum would answer. The plane of the 2.5.2 compiler has no target_tenant
-// field: until the 2.5 line carries tacplus-dev/tacplus#207
-// (tacplus-dev/tacplus#235), a call reaches whichever instance answers, and these
-// checks are what keep one tenant's token from resolving another tenant's row.
+// THE TENANT IS CHECKED HERE ON BOTH SIDES OF A CALL, as well as by the store. A
+// call that names no tid is refused before it is sent; a write of a row outside
+// /tenants/<tenant> is refused before it is sent; and a row read back that is
+// not the tenant's is treated as absent (a list or a watch drops it). The
+// generated client routes each call by its target_tenant and the store refuses
+// a call or a row of another tenant (tacplus-dev/tacplus#207); these checks are
+// the same rule, applied before anything is sent.
 type recordStore struct {
 	records *query_gc.RecordMapClient
 }
@@ -169,23 +169,24 @@ func (r *recordStore) FetchBlob(ctx context.Context, tenant, blobID string) (*bl
 	if err := routable(tenant); err != nil {
 		return nil, err
 	}
-	resp, err := r.records.GetBlob(ctx, &query_pb.GetBlobRequest{BlobId: blobID})
+	resp, err := r.records.GetBlob(ctx, &query_pb.GetBlobRequest{BlobId: blobID, TargetTenant: tenant})
 	return absentIsNil(tenant, resp.GetItem(), err, "reading Blob")
 }
 
-func (r *recordStore) ListBlobsInGroup(ctx context.Context, tenant, group, namespace string) ([]*blobstore_pb.Blob, error) {
+func (r *recordStore) ListBlobsInGroup(ctx context.Context, tenant, group string) ([]*blobstore_pb.Blob, error) {
 	if err := routable(tenant); err != nil {
 		return nil, err
 	}
 	handle, err := r.records.CreateBlobQuery(ctx, &query_pb.OpenBlobQueryRequest{
-		Filter: &query_pb.BlobFilter{Group: &group, Namespace: &namespace},
+		Filter:       &query_pb.BlobFilter{Group: &group},
+		TargetTenant: tenant,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("opening Blob query: %w", err)
 	}
-	defer r.closeQuery("Blob", handle, r.records.DeleteBlobQuery)
+	defer r.closeQuery("Blob", tenant, handle, r.records.DeleteBlobQuery)
 	rows, err := drain(ctx, handle.GetQueryId(), r.records.ListBlobPage, func(queryID, token string) *query_pb.PullBlobRequest {
-		return &query_pb.PullBlobRequest{QueryId: queryID, PageSize: recordPageSize, PageToken: token}
+		return &query_pb.PullBlobRequest{QueryId: queryID, PageSize: recordPageSize, PageToken: token, TargetTenant: tenant}
 	})
 	return tenantRows(tenant, rows, err)
 }
@@ -194,7 +195,7 @@ func (r *recordStore) FetchLink(ctx context.Context, tenant, tokenHash string) (
 	if err := routable(tenant); err != nil {
 		return nil, err
 	}
-	resp, err := r.records.GetBlobLink(ctx, &query_pb.GetBlobLinkRequest{TokenHash: tokenHash})
+	resp, err := r.records.GetBlobLink(ctx, &query_pb.GetBlobLinkRequest{TokenHash: tokenHash, TargetTenant: tenant})
 	// The key is a hash of a credential, so it is never put in an error.
 	return absentIsNil(tenant, resp.GetItem(), err, "reading BlobLink")
 }
@@ -204,14 +205,15 @@ func (r *recordStore) ListLinksForBlob(ctx context.Context, tenant, blobID, name
 		return nil, err
 	}
 	handle, err := r.records.CreateBlobLinkQuery(ctx, &query_pb.OpenBlobLinkQueryRequest{
-		Filter: &query_pb.BlobLinkFilter{BlobId: &blobID, Namespace: &namespace},
+		Filter:       &query_pb.BlobLinkFilter{BlobId: &blobID, Namespace: &namespace},
+		TargetTenant: tenant,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("opening BlobLink query: %w", err)
 	}
-	defer r.closeQuery("BlobLink", handle, r.records.DeleteBlobLinkQuery)
+	defer r.closeQuery("BlobLink", tenant, handle, r.records.DeleteBlobLinkQuery)
 	rows, err := drain(ctx, handle.GetQueryId(), r.records.ListBlobLinkPage, func(queryID, token string) *query_pb.PullBlobLinkRequest {
-		return &query_pb.PullBlobLinkRequest{QueryId: queryID, PageSize: recordPageSize, PageToken: token}
+		return &query_pb.PullBlobLinkRequest{QueryId: queryID, PageSize: recordPageSize, PageToken: token, TargetTenant: tenant}
 	})
 	return tenantRows(tenant, rows, err)
 }
@@ -220,7 +222,7 @@ func (r *recordStore) FetchSession(ctx context.Context, tenant, uploadID string)
 	if err := routable(tenant); err != nil {
 		return nil, err
 	}
-	resp, err := r.records.GetUploadSession(ctx, &query_pb.GetUploadSessionRequest{UploadId: uploadID})
+	resp, err := r.records.GetUploadSession(ctx, &query_pb.GetUploadSessionRequest{UploadId: uploadID, TargetTenant: tenant})
 	return absentIsNil(tenant, resp.GetItem(), err, "reading UploadSession")
 }
 
@@ -233,14 +235,15 @@ func (r *recordStore) ListExpiredSessions(ctx context.Context, tenant string, no
 	}
 	from := int64(1)
 	handle, err := r.records.CreateUploadSessionQuery(ctx, &query_pb.OpenUploadSessionQueryRequest{
-		Filter: &query_pb.UploadSessionFilter{ExpiresMsFrom: &from, ExpiresMsTo: &nowMs},
+		Filter:       &query_pb.UploadSessionFilter{ExpiresMsFrom: &from, ExpiresMsTo: &nowMs},
+		TargetTenant: tenant,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("opening UploadSession query: %w", err)
 	}
-	defer r.closeQuery("UploadSession", handle, r.records.DeleteUploadSessionQuery)
+	defer r.closeQuery("UploadSession", tenant, handle, r.records.DeleteUploadSessionQuery)
 	rows, err := drain(ctx, handle.GetQueryId(), r.records.ListUploadSessionPage, func(queryID, token string) *query_pb.PullUploadSessionRequest {
-		return &query_pb.PullUploadSessionRequest{QueryId: queryID, PageSize: recordPageSize, PageToken: token}
+		return &query_pb.PullUploadSessionRequest{QueryId: queryID, PageSize: recordPageSize, PageToken: token, TargetTenant: tenant}
 	})
 	return tenantRows(tenant, rows, err)
 }
@@ -249,7 +252,7 @@ func (r *recordStore) FetchLinkStats(ctx context.Context, tenant, tokenHash stri
 	if err := routable(tenant); err != nil {
 		return nil, err
 	}
-	resp, err := r.records.GetBlobLinkStats(ctx, &query_pb.GetBlobLinkStatsRequest{TokenHash: tokenHash})
+	resp, err := r.records.GetBlobLinkStats(ctx, &query_pb.GetBlobLinkStatsRequest{TokenHash: tokenHash, TargetTenant: tenant})
 	return absentIsNil(tenant, resp.GetItem(), err, "reading BlobLinkStats")
 }
 
@@ -323,7 +326,7 @@ func (r *recordStore) PutBlob(ctx context.Context, tenant string, rec *blobstore
 	if err := writable(tenant, rec); err != nil {
 		return err
 	}
-	_, err := r.records.PutBlob(ctx, &query_pb.PutBlobRequest{Item: rec})
+	_, err := r.records.PutBlob(ctx, &query_pb.PutBlobRequest{Item: rec, TargetTenant: tenant})
 	return writeError("writing Blob "+rec.GetBlobId(), err)
 }
 
@@ -332,8 +335,9 @@ func (r *recordStore) ReplaceBlob(ctx context.Context, tenant string, prev, next
 		return err
 	}
 	_, err := r.records.ReplaceIfUnchangedBlob(ctx, &query_pb.ReplaceIfUnchangedBlobRequest{
-		Item:     next,
-		Expected: &query_pb.ReplaceIfUnchangedBlobRequest_ExpectedItem{ExpectedItem: prev},
+		Item:         next,
+		Expected:     &query_pb.ReplaceIfUnchangedBlobRequest_ExpectedItem{ExpectedItem: prev},
+		TargetTenant: tenant,
 	})
 	return writeError("replacing Blob "+next.GetBlobId(), err)
 }
@@ -342,7 +346,7 @@ func (r *recordStore) InsertSession(ctx context.Context, tenant string, rec *blo
 	if err := writable(tenant, rec); err != nil {
 		return err
 	}
-	_, err := r.records.InsertIfAbsentUploadSession(ctx, &query_pb.InsertIfAbsentUploadSessionRequest{Item: rec})
+	_, err := r.records.InsertIfAbsentUploadSession(ctx, &query_pb.InsertIfAbsentUploadSessionRequest{Item: rec, TargetTenant: tenant})
 	return writeError("inserting UploadSession "+rec.GetUploadId(), err)
 }
 
@@ -351,8 +355,9 @@ func (r *recordStore) ReplaceSession(ctx context.Context, tenant string, prev, n
 		return err
 	}
 	_, err := r.records.ReplaceIfUnchangedUploadSession(ctx, &query_pb.ReplaceIfUnchangedUploadSessionRequest{
-		Item:     next,
-		Expected: &query_pb.ReplaceIfUnchangedUploadSessionRequest_ExpectedItem{ExpectedItem: prev},
+		Item:         next,
+		Expected:     &query_pb.ReplaceIfUnchangedUploadSessionRequest_ExpectedItem{ExpectedItem: prev},
+		TargetTenant: tenant,
 	})
 	return writeError("replacing UploadSession "+next.GetUploadId(), err)
 }
@@ -361,7 +366,7 @@ func (r *recordStore) InsertLink(ctx context.Context, tenant string, rec *blobst
 	if err := writable(tenant, rec); err != nil {
 		return err
 	}
-	_, err := r.records.InsertIfAbsentBlobLink(ctx, &query_pb.InsertIfAbsentBlobLinkRequest{Item: rec})
+	_, err := r.records.InsertIfAbsentBlobLink(ctx, &query_pb.InsertIfAbsentBlobLinkRequest{Item: rec, TargetTenant: tenant})
 	return writeError("inserting BlobLink for "+rec.GetBlobId(), err)
 }
 
@@ -370,8 +375,9 @@ func (r *recordStore) ReplaceLink(ctx context.Context, tenant string, prev, next
 		return err
 	}
 	_, err := r.records.ReplaceIfUnchangedBlobLink(ctx, &query_pb.ReplaceIfUnchangedBlobLinkRequest{
-		Item:     next,
-		Expected: &query_pb.ReplaceIfUnchangedBlobLinkRequest_ExpectedItem{ExpectedItem: prev},
+		Item:         next,
+		Expected:     &query_pb.ReplaceIfUnchangedBlobLinkRequest_ExpectedItem{ExpectedItem: prev},
+		TargetTenant: tenant,
 	})
 	return writeError("replacing BlobLink for "+next.GetBlobId(), err)
 }
@@ -380,7 +386,7 @@ func (r *recordStore) InsertLinkStats(ctx context.Context, tenant string, rec *b
 	if err := writable(tenant, rec); err != nil {
 		return err
 	}
-	_, err := r.records.InsertIfAbsentBlobLinkStats(ctx, &query_pb.InsertIfAbsentBlobLinkStatsRequest{Item: rec})
+	_, err := r.records.InsertIfAbsentBlobLinkStats(ctx, &query_pb.InsertIfAbsentBlobLinkStatsRequest{Item: rec, TargetTenant: tenant})
 	return writeError("inserting BlobLinkStats", err)
 }
 
@@ -389,8 +395,9 @@ func (r *recordStore) ReplaceLinkStats(ctx context.Context, tenant string, prev,
 		return err
 	}
 	_, err := r.records.ReplaceIfUnchangedBlobLinkStats(ctx, &query_pb.ReplaceIfUnchangedBlobLinkStatsRequest{
-		Item:     next,
-		Expected: &query_pb.ReplaceIfUnchangedBlobLinkStatsRequest_ExpectedItem{ExpectedItem: prev},
+		Item:         next,
+		Expected:     &query_pb.ReplaceIfUnchangedBlobLinkStatsRequest_ExpectedItem{ExpectedItem: prev},
+		TargetTenant: tenant,
 	})
 	return writeError("replacing BlobLinkStats", err)
 }
@@ -423,7 +430,7 @@ func (r *recordStore) WatchBlobs(ctx context.Context, tenant string) (iter.Seq2[
 	if err := routable(tenant); err != nil {
 		return nil, err
 	}
-	events, err := r.records.WatchBlobChanges(ctx, &query_pb.WatchBlobChangesRequest{})
+	events, err := r.records.WatchBlobChanges(ctx, &query_pb.WatchBlobChangesRequest{TargetTenant: tenant})
 	return changes[blobstore_pb.Blob, *blobstore_pb.Blob](tenant, events, err)
 }
 
@@ -431,7 +438,7 @@ func (r *recordStore) WatchSessions(ctx context.Context, tenant string) (iter.Se
 	if err := routable(tenant); err != nil {
 		return nil, err
 	}
-	events, err := r.records.WatchUploadSessionChanges(ctx, &query_pb.WatchUploadSessionChangesRequest{})
+	events, err := r.records.WatchUploadSessionChanges(ctx, &query_pb.WatchUploadSessionChangesRequest{TargetTenant: tenant})
 	return changes[blobstore_pb.UploadSession, *blobstore_pb.UploadSession](tenant, events, err)
 }
 
@@ -439,7 +446,7 @@ func (r *recordStore) WatchLinks(ctx context.Context, tenant string) (iter.Seq2[
 	if err := routable(tenant); err != nil {
 		return nil, err
 	}
-	events, err := r.records.WatchBlobLinkChanges(ctx, &query_pb.WatchBlobLinkChangesRequest{})
+	events, err := r.records.WatchBlobLinkChanges(ctx, &query_pb.WatchBlobLinkChangesRequest{TargetTenant: tenant})
 	return changes[blobstore_pb.BlobLink, *blobstore_pb.BlobLink](tenant, events, err)
 }
 
@@ -447,7 +454,7 @@ func (r *recordStore) WatchLinkStats(ctx context.Context, tenant string) (iter.S
 	if err := routable(tenant); err != nil {
 		return nil, err
 	}
-	events, err := r.records.WatchBlobLinkStatsChanges(ctx, &query_pb.WatchBlobLinkStatsChangesRequest{})
+	events, err := r.records.WatchBlobLinkStatsChanges(ctx, &query_pb.WatchBlobLinkStatsChangesRequest{TargetTenant: tenant})
 	return changes[blobstore_pb.BlobLinkStats, *blobstore_pb.BlobLinkStats](tenant, events, err)
 }
 
@@ -504,15 +511,15 @@ func changes[T any, P interface {
 
 // closeQuery closes a standing query on every path, success included: a query
 // left open is a predicate stratum keeps evaluating for a caller that has gone
-// away.
+// away. The handle names its tenant, like every other call.
 func (r *recordStore) closeQuery(
-	kind string,
+	kind, tenant string,
 	handle *query_pb.QueryHandle,
 	del func(context.Context, *query_pb.QueryHandle, ...grpc.CallOption) (*query_pb.QueryStats, error),
 ) {
 	// A fresh context: the caller's may already be cancelled, and the close has
 	// to happen anyway.
-	if _, err := del(context.WithoutCancel(context.Background()), &query_pb.QueryHandle{QueryId: handle.GetQueryId()}); err != nil {
+	if _, err := del(context.WithoutCancel(context.Background()), &query_pb.QueryHandle{QueryId: handle.GetQueryId(), TargetTenant: tenant}); err != nil {
 		zap.L().Warn("failed to close record query", zap.String("record", kind), zap.Error(err))
 	}
 }

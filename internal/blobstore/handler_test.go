@@ -14,13 +14,20 @@ import (
 )
 
 // callerFor builds the verified-caller value the generated wrapper hands a
-// handler. The tenant half of authorization has already run by then — every RPC
-// declares target_namespace_field — so what these tests exercise is the SERVICE
-// half: is this caller the row's owner (R6).
-func callerFor(service string) *servicemanager.Caller {
-	tok := wrapperToken.NewImmutableToken(nil).SetSubType("service").SetSubject(service)
+// handler, for a service of testTenant. The generated half of authorization has
+// already run by then — the tenant door and target_namespace_field — so what
+// these tests exercise is the handler's: is the caller of this instance's
+// tenant, and is it the row's owner (R6).
+func callerFor(service string) *servicemanager.Caller { return callerIn(service, testNS) }
+
+// callerIn is callerFor for a service whose token namespace is namespace.
+func callerIn(service, namespace string) *servicemanager.Caller {
+	tok := wrapperToken.NewImmutableToken(nil).SetSubType("service").SetSubject(service).SetNamespace(namespace)
 	return servicemanager.NewCaller(tok, "test-request")
 }
+
+// callerT is the caller a handler takes.
+type callerT = *servicemanager.Caller
 
 func codeOf(err error) codes.Code { return status.Code(err) }
 
@@ -36,7 +43,7 @@ func TestCreateUploadReservesQuotaAndRefusesPastIt(t *testing.T) {
 			ContentHash: strings.Repeat("a", 64),
 			SizeBytes:   size,
 			ContentType: "application/pdf",
-			Namespace:   testNS,
+			Namespace:   testNS, Tenant: testTenant,
 		}
 	}
 
@@ -63,7 +70,7 @@ func TestCreateUploadReservesQuotaAndRefusesPastIt(t *testing.T) {
 	if pending == "" {
 		t.Fatal("no pending session to cancel")
 	}
-	resp, err := h.CancelUpload(ctx, caller, &blobstore_pb.CancelUploadRequest{UploadId: pending, Namespace: testNS})
+	resp, err := h.CancelUpload(ctx, caller, &blobstore_pb.CancelUploadRequest{UploadId: pending, Namespace: testNS, Tenant: testTenant})
 	if err != nil || !resp.GetCancelled() {
 		t.Fatalf("CancelUpload: resp=%v err=%v", resp, err)
 	}
@@ -72,7 +79,7 @@ func TestCreateUploadReservesQuotaAndRefusesPastIt(t *testing.T) {
 	}
 
 	// CancelUpload is idempotent.
-	again, err := h.CancelUpload(ctx, caller, &blobstore_pb.CancelUploadRequest{UploadId: pending, Namespace: testNS})
+	again, err := h.CancelUpload(ctx, caller, &blobstore_pb.CancelUploadRequest{UploadId: pending, Namespace: testNS, Tenant: testTenant})
 	if err != nil {
 		t.Fatalf("second CancelUpload: %v", err)
 	}
@@ -88,11 +95,11 @@ func TestCreateUploadRefusesAGroupRuleBreach(t *testing.T) {
 	caller := callerFor("docmanager")
 
 	cases := map[string]*blobstore_pb.CreateUploadRequest{
-		"unknown group": {Group: "photos", ContentHash: strings.Repeat("a", 64), SizeBytes: 10, ContentType: "application/pdf", Namespace: testNS},
+		"unknown group": {Group: "photos", ContentHash: strings.Repeat("a", 64), SizeBytes: 10, ContentType: "application/pdf", Namespace: testNS, Tenant: testTenant},
 		"type not allowed": {Group: testGroup, ContentHash: strings.Repeat("a", 64), SizeBytes: 10,
-			ContentType: "application/x-msdownload", Namespace: testNS},
+			ContentType: "application/x-msdownload", Namespace: testNS, Tenant: testTenant},
 		"past max_blob_bytes": {Group: testGroup, ContentHash: strings.Repeat("a", 64), SizeBytes: 99999,
-			ContentType: "application/pdf", Namespace: testNS},
+			ContentType: "application/pdf", Namespace: testNS, Tenant: testTenant},
 	}
 	for name, req := range cases {
 		if _, err := h.CreateUpload(ctx, caller, req); codeOf(err) != codes.FailedPrecondition {
@@ -103,7 +110,7 @@ func TestCreateUploadRefusesAGroupRuleBreach(t *testing.T) {
 	// A hash or namespace that is not a legal path segment is INVALID_ARGUMENT, not
 	// FailedPrecondition: the request itself is malformed.
 	bad := &blobstore_pb.CreateUploadRequest{Group: testGroup, ContentHash: "../../x", SizeBytes: 10,
-		ContentType: "application/pdf", Namespace: testNS}
+		ContentType: "application/pdf", Namespace: testNS, Tenant: testTenant}
 	if _, err := h.CreateUpload(ctx, caller, bad); codeOf(err) != codes.InvalidArgument {
 		t.Errorf("a traversal content hash: got %v, want InvalidArgument", err)
 	}
@@ -118,7 +125,7 @@ func TestCreateUploadReportsAlreadyPresent(t *testing.T) {
 
 	resp, err := h.CreateUpload(context.Background(), callerFor("docmanager"), &blobstore_pb.CreateUploadRequest{
 		Group: sess.GetGroup(), ContentHash: sess.GetContentHash(), SizeBytes: sess.GetSizeBytes(),
-		ContentType: sess.GetContentType(), Namespace: sess.GetNamespace(),
+		ContentType: sess.GetContentType(), Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if err != nil {
 		t.Fatalf("CreateUpload: %v", err)
@@ -144,21 +151,17 @@ func TestAnotherServicesBlobIsNotFound(t *testing.T) {
 	intruder := callerFor("someoneelse")
 
 	if _, err := h.CreateLink(ctx, intruder, &blobstore_pb.CreateLinkRequest{
-		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: sess.GetNamespace(),
+		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: sess.GetNamespace(), Tenant: testTenant,
 	}); codeOf(err) != codes.NotFound {
 		t.Errorf("CreateLink by a non-owner: got %v, want NotFound", err)
 	}
 	if _, err := h.DeleteBlob(ctx, intruder, &blobstore_pb.DeleteBlobRequest{
-		BlobId: blobIDOf(sess), Namespace: sess.GetNamespace(),
+		BlobId: blobIDOf(sess), Namespace: sess.GetNamespace(), Tenant: testTenant,
 	}); codeOf(err) != codes.NotFound {
 		t.Errorf("DeleteBlob by a non-owner: got %v, want NotFound", err)
 	}
-	// And the owner naming another tenant's namespace is refused the same way.
-	if _, err := h.CreateLink(ctx, callerFor("docmanager"), &blobstore_pb.CreateLinkRequest{
-		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: "/tenants/other001",
-	}); codeOf(err) != codes.NotFound {
-		t.Errorf("CreateLink naming another tenant: got %v, want NotFound", err)
-	}
+	// Another tenant's namespace is not this instance's at all: see
+	// TestRPCsRoutedToAnotherTenantAreRefused.
 }
 
 // CreateLink returns the raw token once; the row holds only its hash (R7).
@@ -168,7 +171,7 @@ func TestCreateLinkReturnsTheTokenOnceAndStoresOnlyItsHash(t *testing.T) {
 	sess := p.uploadOne(t)
 
 	resp, err := h.CreateLink(context.Background(), callerFor("docmanager"), &blobstore_pb.CreateLinkRequest{
-		BlobId: blobIDOf(sess), Filename: "report.pdf", Namespace: sess.GetNamespace(),
+		BlobId: blobIDOf(sess), Filename: "report.pdf", Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if err != nil {
 		t.Fatalf("CreateLink: %v", err)
@@ -195,7 +198,7 @@ func TestCreateLinkReturnsTheTokenOnceAndStoresOnlyItsHash(t *testing.T) {
 
 	// A filename that would break the header is refused at mint, once.
 	if _, err := h.CreateLink(context.Background(), callerFor("docmanager"), &blobstore_pb.CreateLinkRequest{
-		BlobId: blobIDOf(sess), Filename: "x.pdf\r\nSet-Cookie: a=b", Namespace: sess.GetNamespace(),
+		BlobId: blobIDOf(sess), Filename: "x.pdf\r\nSet-Cookie: a=b", Namespace: sess.GetNamespace(), Tenant: testTenant,
 	}); codeOf(err) != codes.InvalidArgument {
 		t.Errorf("a header-injecting filename: got %v, want InvalidArgument", err)
 	}
@@ -208,7 +211,7 @@ func TestCreateBlobUrlIsShortLived(t *testing.T) {
 	sess := p.uploadOne(t)
 
 	resp, err := h.CreateBlobUrl(context.Background(), callerFor("docmanager"), &blobstore_pb.CreateBlobUrlRequest{
-		BlobId: blobIDOf(sess), Filename: "report.pdf", TtlSeconds: 60, Namespace: sess.GetNamespace(),
+		BlobId: blobIDOf(sess), Filename: "report.pdf", TtlSeconds: 60, Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if err != nil {
 		t.Fatalf("CreateBlobUrl: %v", err)
@@ -228,14 +231,14 @@ func TestRevokeLinkKeepsTheRowAndIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	sess := p.uploadOne(t)
 	link, err := h.CreateLink(ctx, callerFor("docmanager"), &blobstore_pb.CreateLinkRequest{
-		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: sess.GetNamespace(),
+		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if err != nil {
 		t.Fatalf("CreateLink: %v", err)
 	}
 
 	first, err := h.RevokeLink(ctx, callerFor("docmanager"), &blobstore_pb.RevokeLinkRequest{
-		TokenHash: link.GetTokenHash(), Namespace: sess.GetNamespace(),
+		TokenHash: link.GetTokenHash(), Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if err != nil || !first.GetRevoked() {
 		t.Fatalf("RevokeLink: resp=%v err=%v", first, err)
@@ -249,7 +252,7 @@ func TestRevokeLinkKeepsTheRowAndIsIdempotent(t *testing.T) {
 	}
 
 	second, err := h.RevokeLink(ctx, callerFor("docmanager"), &blobstore_pb.RevokeLinkRequest{
-		TokenHash: link.GetTokenHash(), Namespace: sess.GetNamespace(),
+		TokenHash: link.GetTokenHash(), Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if err != nil {
 		t.Fatalf("second RevokeLink: %v", err)
@@ -270,13 +273,13 @@ func TestListLinksPagesAndCarriesNoTokens(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		if _, err := h.CreateLink(ctx, owner, &blobstore_pb.CreateLinkRequest{
-			BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: sess.GetNamespace(),
+			BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: sess.GetNamespace(), Tenant: testTenant,
 		}); err != nil {
 			t.Fatalf("CreateLink %d: %v", i, err)
 		}
 	}
 
-	req := &blobstore_pb.ListLinksRequest{BlobId: blobIDOf(sess), Namespace: sess.GetNamespace()}
+	req := &blobstore_pb.ListLinksRequest{BlobId: blobIDOf(sess), Namespace: sess.GetNamespace(), Tenant: testTenant}
 	var seen []string
 	var after *collection.Cursor
 	for pages := 0; ; pages++ {
@@ -329,19 +332,19 @@ func TestDeleteBlobRemovesTheBytesFromBothPods(t *testing.T) {
 	owner := callerFor("docmanager")
 
 	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		if !svc.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+		if !svc.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 			t.Fatalf("pod %s does not hold the blob before the delete", name)
 		}
 	}
 
 	resp, err := h.DeleteBlob(ctx, owner, &blobstore_pb.DeleteBlobRequest{
-		BlobId: blobIDOf(sess), Namespace: sess.GetNamespace(),
+		BlobId: blobIDOf(sess), Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if err != nil || !resp.GetDeleted() {
 		t.Fatalf("DeleteBlob: resp=%v err=%v", resp, err)
 	}
 	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		if svc.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+		if svc.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 			t.Errorf("pod %s still holds the bytes after the delete", name)
 		}
 	}
@@ -350,7 +353,7 @@ func TestDeleteBlobRemovesTheBytesFromBothPods(t *testing.T) {
 	}
 
 	again, err := h.DeleteBlob(ctx, owner, &blobstore_pb.DeleteBlobRequest{
-		BlobId: blobIDOf(sess), Namespace: sess.GetNamespace(),
+		BlobId: blobIDOf(sess), Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if err != nil {
 		t.Fatalf("second DeleteBlob: %v", err)
@@ -369,12 +372,12 @@ func TestDeleteBlobFailsWhenThePeerCannotBeReached(t *testing.T) {
 	p.bPeerRoute.set(nil)
 
 	_, err := h.DeleteBlob(context.Background(), callerFor("docmanager"), &blobstore_pb.DeleteBlobRequest{
-		BlobId: blobIDOf(sess), Namespace: sess.GetNamespace(),
+		BlobId: blobIDOf(sess), Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if codeOf(err) != codes.Unavailable {
 		t.Fatalf("DeleteBlob with the peer down: got %v, want Unavailable", err)
 	}
-	if !p.a.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+	if !p.a.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 		t.Error("the local bytes were removed even though the peer's could not be")
 	}
 	if p.records.blobs[blobIDOf(sess)].GetDeleted() {
@@ -393,17 +396,17 @@ func TestRpcsFailClosedWhenStratumIsUnreachable(t *testing.T) {
 
 	if _, err := h.CreateUpload(ctx, owner, &blobstore_pb.CreateUploadRequest{
 		Group: testGroup, ContentHash: strings.Repeat("b", 64), SizeBytes: 10,
-		ContentType: "application/pdf", Namespace: testNS,
+		ContentType: "application/pdf", Namespace: testNS, Tenant: testTenant,
 	}); codeOf(err) != codes.Unavailable {
 		t.Errorf("CreateUpload: got %v, want Unavailable", err)
 	}
 	if _, err := h.CreateLink(ctx, owner, &blobstore_pb.CreateLinkRequest{
-		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: testNS,
+		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: testNS, Tenant: testTenant,
 	}); codeOf(err) != codes.Unavailable {
 		t.Errorf("CreateLink: got %v, want Unavailable", err)
 	}
 	if _, err := h.DeleteBlob(ctx, owner, &blobstore_pb.DeleteBlobRequest{
-		BlobId: blobIDOf(sess), Namespace: testNS,
+		BlobId: blobIDOf(sess), Namespace: testNS, Tenant: testTenant,
 	}); codeOf(err) != codes.Unavailable {
 		t.Errorf("DeleteBlob: got %v, want Unavailable", err)
 	}
@@ -422,7 +425,7 @@ func TestGetLinkStatsIncludesTheUnflushedDelta(t *testing.T) {
 	p.get(t, p.aBytes, token).Body.Close()
 
 	before, err := h.GetLinkStats(ctx, callerFor("docmanager"), &blobstore_pb.GetLinkStatsRequest{
-		TokenHash: tokenHash, Namespace: sess.GetNamespace(),
+		TokenHash: tokenHash, Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if err != nil {
 		t.Fatalf("GetLinkStats: %v", err)
@@ -437,7 +440,7 @@ func TestGetLinkStatsIncludesTheUnflushedDelta(t *testing.T) {
 	p.a.stats.Flush(ctx)
 	p.get(t, p.aBytes, token).Body.Close()
 	after, err := h.GetLinkStats(ctx, callerFor("docmanager"), &blobstore_pb.GetLinkStatsRequest{
-		TokenHash: tokenHash, Namespace: sess.GetNamespace(),
+		TokenHash: tokenHash, Namespace: sess.GetNamespace(), Tenant: testTenant,
 	})
 	if err != nil {
 		t.Fatalf("GetLinkStats: %v", err)
@@ -481,7 +484,7 @@ func TestSweepSettlesExpiredSessionsAndFreesTheirQuota(t *testing.T) {
 	caller := callerFor("docmanager")
 	req := &blobstore_pb.CreateUploadRequest{
 		Group: testGroup, ContentHash: strings.Repeat("a", 64), SizeBytes: 1024,
-		ContentType: "application/pdf", Namespace: testNS,
+		ContentType: "application/pdf", Namespace: testNS, Tenant: testTenant,
 	}
 
 	// Fill the quota with reservations that are never used.

@@ -3,17 +3,15 @@ package blobstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/tacplus-dev/blobstore/tacplus/chassis/serviceconnection"
 	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
-	servicehealth_pb "github.com/tacplus-dev/blobstore/tacplus/types/sys/servicehealth"
 	"go.uber.org/zap"
 )
 
@@ -32,8 +30,14 @@ type Service struct {
 	records Records
 	quota   *Quota
 	stats   *Stats
-	tenants Tenants
 	now     func() time.Time
+
+	// tenant is the tid of the one tenant this instance serves: blobstore is
+	// tenant_owned (#9), and its instance in /tenants/<tid> holds and serves
+	// only that tenant's blobs. Every record call is routed to it, a byte path
+	// under any other tid is a 404, and an RPC routed to, naming or called from
+	// any other tenant is refused.
+	tenant string
 
 	// cfg is swapped wholesale on every config delivery. An atomic pointer rather
 	// than a mutex-guarded struct: every request reads it and none of them mutates
@@ -59,10 +63,10 @@ type runtimeConfig struct {
 	sessionSweep time.Duration
 }
 
-// NewService builds the service. It does NOT read config: Configure does, and it
-// is called by the generated handler before the server starts and again on every
-// update. tenants is what the sweep walks: see Tenants.
-func NewService(store *Store, mirror *Mirror, records Records, tenants Tenants, now func() time.Time) *Service {
+// NewService builds the service of tenant's instance. It does NOT read config:
+// Configure does, and it is called by the generated handler before the server
+// starts and again on every update.
+func NewService(store *Store, mirror *Mirror, records Records, tenant string, now func() time.Time) *Service {
 	if now == nil {
 		now = time.Now
 	}
@@ -71,43 +75,26 @@ func NewService(store *Store, mirror *Mirror, records Records, tenants Tenants, 
 		mirror:  mirror,
 		records: records,
 		quota:   NewQuota(records),
-		stats:   NewStats(records, now),
-		tenants: tenants,
+		stats:   NewStats(records, tenant, now),
 		now:     now,
+		tenant:  tenant,
 	}
 }
 
-// Tenants lists the tenants whose rows the sweep settles: each has its own
-// Stratum, and nothing reads across them (#8).
-type Tenants func() []string
+// Tenant is the tid of the tenant this instance serves.
+func (s *Service) Tenant() string { return s.tenant }
 
-// StratumTenants is Tenants from kernel: the tenants that kernel's service
-// health reports a Stratum instance for (spiffe_id
-// spiffe://<td>/tenants/<tid>/services/stratum). A tenant with no Stratum up has
-// no store the sweep could reach; its sessions are settled on the first sweep
-// after one comes back.
-func StratumTenants(health func() *servicehealth_pb.ServiceHealth) Tenants {
-	return func() []string {
-		seen := map[string]bool{}
-		var out []string
-		for _, inst := range health().GetInstances() {
-			if inst.GetServiceId() != stratumServiceID {
-				continue
-			}
-			tid, ok := serviceconnection.InstanceTenant(inst.GetSpiffeId())
-			if !ok || seen[tid] {
-				continue
-			}
-			seen[tid] = true
-			out = append(out, tid)
-		}
-		sort.Strings(out)
-		return out
+// InstanceTenant is the tenant of an instance whose own identity is in
+// namespace: the tid of exactly /tenants/<tid>. blobstore runs nowhere else (#9):
+// in /system, or anywhere that is not one tenant's own namespace, it has no
+// tenant to serve and refuses to start.
+func InstanceTenant(namespace string) (string, error) {
+	tid, ok := NamespaceTenant(namespace)
+	if !ok || namespace != "/tenants/"+tid {
+		return "", fmt.Errorf("blobstore is tenant-owned and runs only in a tenant's namespace /tenants/<tid>, not in %q", namespace)
 	}
+	return tid, nil
 }
-
-// stratumServiceID is the record store's service id, as kernel reports it.
-const stratumServiceID = "stratum"
 
 // Configure resolves a delivered Config into the snapshot requests read.
 //
@@ -198,30 +185,23 @@ func (s *Service) RunBackground(ctx context.Context) {
 // which is the other half of "start-up sweeps temp files" — a pod that has been
 // up for a week has had crashes too.
 //
-// PER TENANT (#8): each tenant's sessions are in its own Stratum, so the sweep
-// asks each tenant's store for its own, and one tenant whose store cannot be read
-// does not stop the others' sweep.
+// The sessions are the instance's own tenant's, in its own Stratum (#9): there
+// is no other tenant here to sweep.
 func (s *Service) sweepSessions(ctx context.Context) {
 	if err := s.store.SweepTemps(); err != nil {
 		zap.L().Warn("failed to sweep temp files", zap.Error(err))
 	}
-	for _, tenant := range s.tenants() {
-		s.sweepTenant(ctx, tenant)
-	}
-}
-
-func (s *Service) sweepTenant(ctx context.Context, tenant string) {
-	sessions, err := s.records.ListExpiredSessions(ctx, tenant, s.now().UnixMilli())
+	sessions, err := s.records.ListExpiredSessions(ctx, s.tenant, s.now().UnixMilli())
 	if err != nil {
-		zap.L().Warn("failed to list expired upload sessions", zap.String("tenant", tenant), zap.Error(err))
+		zap.L().Warn("failed to list expired upload sessions", zap.Error(err))
 		return
 	}
 	for _, sess := range sessions {
 		if sess.GetState() != blobstore_pb.UploadState_UPLOAD_STATE_PENDING {
 			continue
 		}
-		s.quota.Release(sess.GetUploadId(), sess.GetGroup(), sess.GetNamespace())
-		if err := s.settleSession(ctx, tenant, sess, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
+		s.quota.Release(sess.GetUploadId(), sess.GetGroup())
+		if err := s.settleSession(ctx, sess, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
 			if errors.Is(err, ErrRecordChanged) {
 				// Settled since the list was read: an upload finished or was
 				// cancelled, on this pod or the other. Nothing is left to sweep.
@@ -241,7 +221,7 @@ func (s *Service) sweepTenant(ctx context.Context, tenant string) {
 // The replace is conditional on sess being the stored row, so a session settles
 // once: a second settle (the other pod, the sweep, a cancel racing the upload's
 // end) gets ErrRecordChanged rather than overwriting the first one's state.
-func (s *Service) settleSession(ctx context.Context, tenant string, sess *blobstore_pb.UploadSession, state blobstore_pb.UploadState) error {
+func (s *Service) settleSession(ctx context.Context, sess *blobstore_pb.UploadSession, state blobstore_pb.UploadState) error {
 	next := &blobstore_pb.UploadSession{
 		UploadId:       sess.GetUploadId(),
 		Group:          sess.GetGroup(),
@@ -256,7 +236,7 @@ func (s *Service) settleSession(ctx context.Context, tenant string, sess *blobst
 		Deleted:        true,
 		Namespace:      sess.GetNamespace(),
 	}
-	return s.records.ReplaceSession(ctx, tenant, sess, next)
+	return s.records.ReplaceSession(ctx, s.tenant, sess, next)
 }
 
 // Store, Mirror and Stats are exposed for the tests that assert on what landed on

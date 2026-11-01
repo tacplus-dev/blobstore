@@ -21,6 +21,7 @@ import (
 
 	internal "github.com/tacplus-dev/blobstore/internal/blobstore"
 	loggerchassis "github.com/tacplus-dev/blobstore/tacplus/chassis/logger"
+	tokenchassis "github.com/tacplus-dev/blobstore/tacplus/chassis/token"
 	sm "github.com/tacplus-dev/blobstore/tacplus/s2sm"
 	host_pb "github.com/tacplus-dev/blobstore/tacplus/types/sys/host"
 	"go.uber.org/zap"
@@ -69,6 +70,14 @@ func run() error {
 		return fmt.Errorf("fetching blobstore config from BlobstoreConfigState: %w", err)
 	}
 
+	// blobstore is tenant-owned (#9): this instance serves the one tenant whose
+	// namespace, /tenants/<tid>, its own service token names. Anywhere else (a
+	// /system deployment above all) it has no tenant and does not start.
+	tenant, err := instanceTenant(s)
+	if err != nil {
+		return err
+	}
+
 	store, err := internal.NewStore(cfg.GetDataDir())
 	if err != nil {
 		return err
@@ -79,17 +88,14 @@ func run() error {
 		return err
 	}
 	zap.L().Info("blobstore mirror",
-		zap.String("self", self), zap.String("peer", mirror.Peer()), zap.String("data_dir", store.Root()))
+		zap.String("tenant", tenant), zap.String("self", self), zap.String("peer", mirror.Peer()), zap.String("data_dir", store.Root()))
 
 	// Reads and writes alike go to stratum's record plane: its write surface is
-	// the only way a row reaches the store (#6).
+	// the only way a row reaches the store (#6). Every call is routed to this
+	// instance's own tenant's Stratum.
 	records := internal.NewRecords(s.Grpc().Clients().Vservices().RecordMapClient())
 
-	// The sweep walks the tenants kernel reports a Stratum for: each tenant's
-	// sessions are in its own store (#8).
-	tenants := internal.StratumTenants(s.StateClients().Sys().ServiceHealth().Proto)
-
-	svc := internal.NewService(store, mirror, records, tenants, time.Now)
+	svc := internal.NewService(store, mirror, records, tenant, time.Now)
 	handler := internal.NewHandler(svc)
 
 	// The config the generated lifecycle will deliver is the authority, but the
@@ -119,6 +125,21 @@ func run() error {
 	// health, and handles shutdown. Unlike letsencrypt this service DOES call it —
 	// it has RPCs to serve — so SetServing is Run's job and is not called here.
 	return s.Run(handler)
+}
+
+// instanceTenant is the tid of the tenant this instance serves, from the
+// namespace of its own service token: the same identity the generated door pins
+// itself to.
+func instanceTenant(s *sm.ServiceManager) (string, error) {
+	raw, err := s.GetToken()
+	if err != nil {
+		return "", fmt.Errorf("reading this instance's own token: %w", err)
+	}
+	tok, err := tokenchassis.ParseToken(raw)
+	if err != nil {
+		return "", fmt.Errorf("parsing this instance's own token: %w", err)
+	}
+	return internal.InstanceTenant(tok.GetNamespace())
 }
 
 // serveHTTP binds one plaintext listener and serves it in the background.

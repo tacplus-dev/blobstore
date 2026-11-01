@@ -77,7 +77,7 @@ func TestHashMismatchLeavesNothingOnEitherPod(t *testing.T) {
 	}
 
 	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		if svc.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+		if svc.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 			t.Errorf("pod %s promoted a blob whose hash did not match", name)
 		}
 		assertNoTemps(t, name, svc)
@@ -99,7 +99,7 @@ func TestMagicByteMismatchIsRefused(t *testing.T) {
 		t.Fatalf("magic-byte mismatch: got %d, want 400", got)
 	}
 	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		if svc.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+		if svc.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 			t.Errorf("pod %s promoted a blob that failed the magic-byte check", name)
 		}
 		assertNoTemps(t, name, svc)
@@ -120,7 +120,7 @@ func TestUploadPastMaxBlobBytesIsRefusedOnTheWire(t *testing.T) {
 		t.Fatalf("oversized upload: got %d, want 413", got)
 	}
 	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		if svc.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+		if svc.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 			t.Errorf("pod %s promoted an oversized blob", name)
 		}
 		assertNoTemps(t, name, svc)
@@ -143,38 +143,29 @@ func TestUploadForAnUnknownGroupIsRefused(t *testing.T) {
 	}
 }
 
-// "dedup within tenant only" — the same bytes under two namespaces are two files.
+// "dedup within tenant only" — the same bytes in two tenants are two files, each
+// on its own tenant's instance (#9), and two rows, each in its own Stratum. In
+// one tenant they are one file and one row.
 func TestDedupIsPerTenant(t *testing.T) {
-	p := newPair(t)
-	const otherTenant = "other001"
-	const otherNS = "/tenants/" + otherTenant
+	ours, theirs := twoTenants(t)
 
-	tokenA, sessA := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
-	if got := put(t, p.aBytes, tokenA, pdfBody); got != http.StatusCreated {
-		t.Fatalf("first tenant's upload: got %d, want 201", got)
-	}
-	tokenB, sessB := p.mintUpload(t, p.a, otherNS, "application/pdf", pdfBody)
-	if got := putPath(t, p.aBytes, UploadPath(otherTenant, tokenB), pdfBody); got != http.StatusCreated {
-		t.Fatalf("second tenant's upload: got %d, want 201", got)
-	}
+	ours.createAndPut(t, pdfBody)
+	ours.createAndPut(t, pdfBody)
+	theirs.createAndPut(t, pdfBody)
 
-	if sessA.GetContentHash() != sessB.GetContentHash() {
-		t.Fatal("the two uploads must be the same bytes for this test to mean anything")
-	}
-	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		pathA := svc.store.Path(testGroup, testNS, sessA.GetContentHash())
-		pathB := svc.store.Path(testGroup, otherNS, sessB.GetContentHash())
-		if pathA == pathB {
-			t.Fatalf("pod %s: two tenants share one path %s", name, pathA)
-		}
-		for _, path := range []string{pathA, pathB} {
+	for _, p := range []*pair{ours, theirs} {
+		for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
+			path := svc.store.Path(testGroup, pdfHash())
 			if _, err := os.Stat(path); err != nil {
-				t.Errorf("pod %s: %s is missing: %v", name, path, err)
+				t.Errorf("%s pod %s: %s is missing: %v", p.tenant, name, path, err)
 			}
 		}
+		if len(p.records.blobs) != 1 {
+			t.Errorf("%s: want one Blob row in its own Stratum, got %d", p.tenant, len(p.records.blobs))
+		}
 	}
-	if len(p.records.blobs) != 2 {
-		t.Errorf("want two Blob rows, one per tenant, got %d", len(p.records.blobs))
+	if ours.a.store.Root() == theirs.a.store.Root() {
+		t.Fatal("two tenants' instances share a disk")
 	}
 }
 
@@ -200,17 +191,17 @@ func TestAntiEntropyFillsAnEmptyPVCFromThePeer(t *testing.T) {
 
 	// Pod A's disk is replaced: a fresh, empty PVC at a new path, same peer.
 	replaced := p.newPod(t, "pod-a", hostOf(t, p.aPeer.URL), hostOf(t, p.bPeer.URL))
-	if replaced.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+	if replaced.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 		t.Fatal("a fresh PVC must start empty")
 	}
 
 	replaced.SyncOnStart(context.Background())
 
-	if !replaced.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+	if !replaced.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 		t.Fatal("anti-entropy did not copy the blob the peer holds")
 	}
 	// And the copy is the real bytes, not an empty file named after a hash.
-	got, err := os.ReadFile(replaced.store.Path(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()))
+	got, err := os.ReadFile(replaced.store.Path(sess.GetGroup(), sess.GetContentHash()))
 	if err != nil {
 		t.Fatalf("reading the copied blob: %v", err)
 	}
@@ -223,12 +214,12 @@ func TestAntiEntropyFillsAnEmptyPVCFromThePeer(t *testing.T) {
 // wrong bytes for a hash is refused rather than believed.
 func TestAntiEntropyRefusesBytesThatDoNotHashToTheirName(t *testing.T) {
 	p := newPair(t)
-	key := BlobKey{Group: testGroup, Namespace: testNS, Hash: pdfHash()}
+	key := BlobKey{Group: testGroup, Hash: pdfHash()}
 	err := p.a.store.WriteFrom(key, bytesOf("not the pdf at all"))
 	if err == nil {
 		t.Fatal("WriteFrom accepted bytes that do not hash to the key")
 	}
-	if p.a.store.Has(key.Group, key.Namespace, key.Hash) {
+	if p.a.store.Has(key.Group, key.Hash) {
 		t.Fatal("a mis-hashed anti-entropy copy was promoted")
 	}
 	assertNoTemps(t, "a", p.a)
@@ -242,7 +233,7 @@ func TestPromoteIsDedupAndNeverOverwrites(t *testing.T) {
 	if got := put(t, p.aBytes, token, pdfBody); got != http.StatusCreated {
 		t.Fatalf("first upload: got %d, want 201", got)
 	}
-	path := p.a.store.Path(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash())
+	path := p.a.store.Path(sess.GetGroup(), sess.GetContentHash())
 	first, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
@@ -298,5 +289,5 @@ func assertNoTemps(t *testing.T, pod string, svc *Service) {
 }
 
 func blobIDOf(sess *blobstore_pb.UploadSession) string {
-	return BlobKey{Group: sess.GetGroup(), Namespace: sess.GetNamespace(), Hash: sess.GetContentHash()}.String()
+	return BlobKey{Group: sess.GetGroup(), Hash: sess.GetContentHash()}.String()
 }

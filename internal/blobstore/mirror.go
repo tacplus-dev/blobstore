@@ -15,7 +15,7 @@ import (
 )
 
 // Peer paths. They live on the peer listener, never on the public one: the
-// hashes listing enumerates every blob this pod holds, for every tenant, and the
+// hashes listing enumerates every blob this pod holds, and the
 // gateway proxies only `/upload/` and `/b/`.
 const (
 	PeerPathUpload = "/peer/upload/"
@@ -214,7 +214,7 @@ func (m *Mirror) SyncFromPeer(ctx context.Context, store *Store) (int, error) {
 	}
 	copied := 0
 	for _, k := range want {
-		if store.Has(k.Group, k.Namespace, k.Hash) {
+		if store.Has(k.Group, k.Hash) {
 			continue
 		}
 		if err := m.copyOne(ctx, store, k); err != nil {

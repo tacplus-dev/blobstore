@@ -29,32 +29,32 @@ func TestEveryWriteIsRefusedWhileTheStoreRefusesWrites(t *testing.T) {
 
 	if _, err := h.CreateUpload(ctx, owner, &blobstore_pb.CreateUploadRequest{
 		Group: testGroup, ContentHash: strings.Repeat("b", 64), SizeBytes: 10,
-		ContentType: "application/pdf", Namespace: testNS,
+		ContentType: "application/pdf", Namespace: testNS, Tenant: testTenant,
 	}); codeOf(err) != codes.Unavailable {
 		t.Errorf("CreateUpload: got %v, want Unavailable", err)
 	}
 	if _, err := h.CreateLink(ctx, owner, &blobstore_pb.CreateLinkRequest{
-		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: testNS,
+		BlobId: blobIDOf(sess), Filename: "x.pdf", Namespace: testNS, Tenant: testTenant,
 	}); codeOf(err) != codes.Unavailable {
 		t.Errorf("CreateLink: got %v, want Unavailable", err)
 	}
 	if _, err := h.CreateBlobUrl(ctx, owner, &blobstore_pb.CreateBlobUrlRequest{
-		BlobId: blobIDOf(sess), Filename: "x.pdf", TtlSeconds: 60, Namespace: testNS,
+		BlobId: blobIDOf(sess), Filename: "x.pdf", TtlSeconds: 60, Namespace: testNS, Tenant: testTenant,
 	}); codeOf(err) != codes.Unavailable {
 		t.Errorf("CreateBlobUrl: got %v, want Unavailable", err)
 	}
 	if _, err := h.RevokeLink(ctx, owner, &blobstore_pb.RevokeLinkRequest{
-		TokenHash: LinkTokenHash(link), Namespace: testNS,
+		TokenHash: LinkTokenHash(link), Namespace: testNS, Tenant: testTenant,
 	}); codeOf(err) != codes.Unavailable {
 		t.Errorf("RevokeLink: got %v, want Unavailable", err)
 	}
 	if _, err := h.CancelUpload(ctx, owner, &blobstore_pb.CancelUploadRequest{
-		UploadId: pending.GetUploadId(), Namespace: testNS,
+		UploadId: pending.GetUploadId(), Namespace: testNS, Tenant: testTenant,
 	}); codeOf(err) != codes.Unavailable {
 		t.Errorf("CancelUpload: got %v, want Unavailable", err)
 	}
 	if _, err := h.DeleteBlob(ctx, owner, &blobstore_pb.DeleteBlobRequest{
-		BlobId: blobIDOf(sess), Namespace: testNS,
+		BlobId: blobIDOf(sess), Namespace: testNS, Tenant: testTenant,
 	}); codeOf(err) != codes.Unavailable {
 		t.Errorf("DeleteBlob: got %v, want Unavailable", err)
 	}
@@ -62,7 +62,7 @@ func TestEveryWriteIsRefusedWhileTheStoreRefusesWrites(t *testing.T) {
 	if got := put(t, p.aBytes, token, []byte("hello")); got != http.StatusServiceUnavailable {
 		t.Errorf("PUT: got %d, want 503", got)
 	}
-	key := BlobKey{Group: pending.GetGroup(), Namespace: pending.GetNamespace(), Hash: pending.GetContentHash()}
+	key := BlobKey{Group: pending.GetGroup(), Hash: pending.GetContentHash()}
 	if p.records.blobs[key.String()] != nil {
 		t.Error("a Blob row exists for an upload whose write was refused")
 	}
@@ -112,7 +112,7 @@ func TestCancelUploadDoesNotOverwriteASessionSettledUnderneathIt(t *testing.T) {
 		p.records.putSession(committed)
 	}
 	resp, err := h.CancelUpload(ctx, callerFor("docmanager"), &blobstore_pb.CancelUploadRequest{
-		UploadId: sess.GetUploadId(), Namespace: testNS,
+		UploadId: sess.GetUploadId(), Namespace: testNS, Tenant: testTenant,
 	})
 	if err != nil || resp.GetCancelled() {
 		t.Fatalf("CancelUpload: got %v, %v; want cancelled=false", resp, err)
@@ -139,7 +139,7 @@ func TestRevokeLinkOfALinkChangedUnderneathItIsAborted(t *testing.T) {
 		p.records.links[tokenHash] = changed
 	}
 	_, err := h.RevokeLink(context.Background(), callerFor("docmanager"), &blobstore_pb.RevokeLinkRequest{
-		TokenHash: tokenHash, Namespace: testNS,
+		TokenHash: tokenHash, Namespace: testNS, Tenant: testTenant,
 	})
 	if codeOf(err) != codes.Aborted {
 		t.Fatalf("RevokeLink: got %v, want Aborted", err)

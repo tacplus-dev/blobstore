@@ -26,7 +26,7 @@ func TestUploadTokenResolvesItsSessionAndSucceeds(t *testing.T) {
 	// The row the token resolved to is what named the bytes' resting place, on
 	// BOTH pods (R2).
 	for name, svc := range map[string]*Service{"a": p.a, "b": p.b} {
-		if !svc.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+		if !svc.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 			t.Errorf("pod %s does not hold the blob", name)
 		}
 	}
@@ -53,7 +53,7 @@ func TestUploadTokenWithNoSessionIsRefused(t *testing.T) {
 		}
 	}
 	// And nothing was written anywhere on the way.
-	if p.a.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+	if p.a.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 		t.Fatal("a refused upload still landed bytes")
 	}
 	// The real token still works, so the refusals above were about the token and
@@ -73,7 +73,7 @@ func TestUploadTokenForAnExpiredSessionIsRefused(t *testing.T) {
 	if got := put(t, p.aBytes, token, pdfBody); got != http.StatusNotFound {
 		t.Fatalf("PUT with an expired session: got %d, want 404", got)
 	}
-	if p.a.store.Has(sess.GetGroup(), sess.GetNamespace(), sess.GetContentHash()) {
+	if p.a.store.Has(sess.GetGroup(), sess.GetContentHash()) {
 		t.Fatal("an expired upload still landed bytes")
 	}
 }

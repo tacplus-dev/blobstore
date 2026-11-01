@@ -16,7 +16,10 @@ import (
 const tmpDirName = "tmp"
 
 // Store is one pod's PVC: content-addressed files under
-// <data_dir>/<group>/<ns>/<sha256-hex>, plus the tmp directory.
+// <data_dir>/<group>/<sha256-hex>, plus the tmp directory.
+//
+// THERE IS NO NAMESPACE LEVEL (#9). The PVC is one tenant instance's own and
+// holds only that tenant's bytes, so the tenant is the disk, not a directory.
 //
 // It knows nothing about records, tokens, groups or peers. A file either has its
 // hash or does not (R2), and that is the entire contract this type implements.
@@ -50,23 +53,23 @@ func (s *Store) Root() string { return s.root }
 func (s *Store) tmpDir() string { return filepath.Join(s.root, tmpDirName) }
 
 // Path is the absolute path of one blob's bytes. The caller is responsible for
-// having validated group, namespace and hash — see validateBlobKey, which every
-// caller that takes any of the three from the wire goes through.
-func (s *Store) Path(group, namespace, hash string) string {
-	return filepath.Join(s.root, group, namespaceDir(namespace), hash)
+// having validated group and hash — see validateBlobKey, which every caller
+// that takes either from the wire goes through.
+func (s *Store) Path(group, hash string) string {
+	return filepath.Join(s.root, group, hash)
 }
 
 // Has reports whether the promoted file exists.
-func (s *Store) Has(group, namespace, hash string) bool {
-	st, err := os.Stat(s.Path(group, namespace, hash))
+func (s *Store) Has(group, hash string) bool {
+	st, err := os.Stat(s.Path(group, hash))
 	return err == nil && st.Mode().IsRegular()
 }
 
 // Open returns the promoted file for reading. The caller closes it. An *os.File
 // is deliberately what comes back rather than an io.Reader: the `/b/` path
 // serves Range requests through http.ServeContent, which needs a ReadSeeker.
-func (s *Store) Open(group, namespace, hash string) (*os.File, os.FileInfo, error) {
-	p := s.Path(group, namespace, hash)
+func (s *Store) Open(group, hash string) (*os.File, os.FileInfo, error) {
+	p := s.Path(group, hash)
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, nil, err
@@ -81,8 +84,8 @@ func (s *Store) Open(group, namespace, hash string) (*os.File, os.FileInfo, erro
 
 // Remove unlinks a promoted file. A missing file is not an error: DeleteBlob is
 // idempotent, and the peer may already have been asked to delete it.
-func (s *Store) Remove(group, namespace, hash string) error {
-	err := os.Remove(s.Path(group, namespace, hash))
+func (s *Store) Remove(group, hash string) error {
+	err := os.Remove(s.Path(group, hash))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -114,7 +117,7 @@ func (s *Store) TempFile(uploadID string) (*os.File, error) {
 // bytes are identical by construction — the name is their hash — so the temp is
 // simply discarded rather than renamed over a good file. A promoted file is
 // never overwritten.
-func (s *Store) Promote(f *os.File, group, namespace, hash string) error {
+func (s *Store) Promote(f *os.File, group, hash string) error {
 	tmpName := f.Name()
 	if err := f.Sync(); err != nil {
 		f.Close()
@@ -124,18 +127,18 @@ func (s *Store) Promote(f *os.File, group, namespace, hash string) error {
 		return fmt.Errorf("closing %s: %w", tmpName, err)
 	}
 
-	dir := filepath.Dir(s.Path(group, namespace, hash))
+	dir := filepath.Dir(s.Path(group, hash))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("creating %s: %w", dir, err)
 	}
 
-	if s.Has(group, namespace, hash) {
+	if s.Has(group, hash) {
 		// Dedup. Drop the temp; the file that is already there is the same file.
 		_ = os.Remove(tmpName)
 		return nil
 	}
 
-	if err := os.Rename(tmpName, s.Path(group, namespace, hash)); err != nil {
+	if err := os.Rename(tmpName, s.Path(group, hash)); err != nil {
 		return fmt.Errorf("promoting %s: %w", tmpName, err)
 	}
 	return fsyncDir(dir)
@@ -172,37 +175,29 @@ func (s *Store) SweepTemps() error {
 // BlobKey identifies one stored file. It is the anti-entropy unit: the listing a
 // peer serves is a set of these, and a pod copies the ones it lacks.
 type BlobKey struct {
-	Group     string
-	Namespace string
-	Hash      string
+	Group string
+	Hash  string
 }
 
-// String is the `<group>/<ns>/<sha256>` form the decision doc specifies — and
-// it is exactly Blob.blob_id, so the anti-entropy listing, the on-disk layout
-// and the record key are one format that cannot drift.
-//
-// THE NAMESPACE SEGMENT IS ENCODED, because a namespace is a PATH
-// ("/tenants/acme") and the id has to stay three "/"-separated segments to be
-// parseable. `/` becomes `:`, which cannot occur in a namespace path (segments
-// are letters, digits, `_` and `-`), so the mapping is total and reversible. The
-// root namespace "/" is therefore ":" — a real segment rather than an empty one,
-// which is what keeps a root-owned blob's id from collapsing to a two-segment
-// string.
+// String is the `<group>/<sha256>` form — and it is exactly Blob.blob_id, so
+// the anti-entropy listing, the on-disk layout and the record key are one
+// format that cannot drift. The tenant is not in it: the key is unique in the
+// tenant's own store, and the bytes are on the tenant's own disks (#9).
 func (k BlobKey) String() string {
-	return k.Group + "/" + namespaceDir(k.Namespace) + "/" + k.Hash
+	return k.Group + "/" + k.Hash
 }
 
-// ParseBlobKey reads the `<group>/<ns>/<sha256>` form back, validating every
-// segment. It is the ONLY way a group, namespace or hash from the wire becomes a
-// path, which is what makes path traversal unrepresentable rather than merely
+// ParseBlobKey reads the `<group>/<sha256>` form back, validating every
+// segment. It is the ONLY way a group or hash from the wire becomes a path,
+// which is what makes path traversal unrepresentable rather than merely
 // unlikely.
 func ParseBlobKey(s string) (BlobKey, error) {
 	parts := strings.Split(s, "/")
-	if len(parts) != 3 {
-		return BlobKey{}, fmt.Errorf("blob key %q is not <group>/<namespace>/<hash>", s)
+	if len(parts) != 2 {
+		return BlobKey{}, fmt.Errorf("blob key %q is not <group>/<hash>", s)
 	}
-	k := BlobKey{Group: parts[0], Namespace: namespaceFromDir(parts[1]), Hash: parts[2]}
-	if err := validateBlobKey(k.Group, k.Namespace, k.Hash); err != nil {
+	k := BlobKey{Group: parts[0], Hash: parts[1]}
+	if err := validateBlobKey(k.Group, k.Hash); err != nil {
 		return BlobKey{}, err
 	}
 	return k, nil
@@ -212,7 +207,7 @@ func ParseBlobKey(s string) (BlobKey, error) {
 //
 // It is only ever called to answer a peer's anti-entropy listing, which is why
 // it is on the peer listener and not the public one: the answer is the complete
-// set of hashes this pod holds, for every tenant.
+// set of hashes this pod holds for its tenant.
 func (s *Store) List() ([]BlobKey, error) {
 	var out []BlobKey
 	groups, err := os.ReadDir(s.root)
@@ -223,28 +218,15 @@ func (s *Store) List() ([]BlobKey, error) {
 		if !g.IsDir() || g.Name() == tmpDirName {
 			continue
 		}
-		nsDirs, err := os.ReadDir(filepath.Join(s.root, g.Name()))
+		files, err := os.ReadDir(filepath.Join(s.root, g.Name()))
 		if err != nil {
 			return nil, err
 		}
-		for _, ns := range nsDirs {
-			if !ns.IsDir() {
+		for _, f := range files {
+			if f.IsDir() {
 				continue
 			}
-			files, err := os.ReadDir(filepath.Join(s.root, g.Name(), ns.Name()))
-			if err != nil {
-				return nil, err
-			}
-			for _, f := range files {
-				if f.IsDir() {
-					continue
-				}
-				out = append(out, BlobKey{
-					Group:     g.Name(),
-					Namespace: namespaceFromDir(ns.Name()),
-					Hash:      f.Name(),
-				})
-			}
+			out = append(out, BlobKey{Group: g.Name(), Hash: f.Name()})
 		}
 	}
 	return out, nil
@@ -268,7 +250,7 @@ func (s *Store) WriteFrom(k BlobKey, r io.Reader) error {
 		s.DiscardTemp(f)
 		return fmt.Errorf("anti-entropy: peer served %s under hash %s", got, k.Hash)
 	}
-	return s.Promote(f, k.Group, k.Namespace, k.Hash)
+	return s.Promote(f, k.Group, k.Hash)
 }
 
 // fsyncDir fsyncs a directory so a rename into it survives a power loss.

@@ -30,7 +30,9 @@ import (
 // exists to avoid.
 type Stats struct {
 	records Records
-	now     func() time.Time
+	// tenant is the instance's tenant, whose Stratum every flush writes to (#9).
+	tenant string
+	now    func() time.Time
 
 	mu      sync.Mutex
 	pending map[string]*statsEntry
@@ -38,10 +40,8 @@ type Stats struct {
 
 // statsEntry is one token's unflushed delta plus the identity the row needs. The
 // owner and namespace are carried because a flush may be the row's FIRST write
-// and a record cannot be written without them; the tenant, because the row is in
-// that tenant's store, which the flush must name (#8).
+// and a record cannot be written without them.
 type statsEntry struct {
-	tenant         string
 	ownerPrincipal string
 	namespace      string
 	resolutions    int64
@@ -49,21 +49,21 @@ type statsEntry struct {
 	lastResolvedMs int64
 }
 
-func NewStats(records Records, now func() time.Time) *Stats {
+func NewStats(records Records, tenant string, now func() time.Time) *Stats {
 	if now == nil {
 		now = time.Now
 	}
-	return &Stats{records: records, now: now, pending: map[string]*statsEntry{}}
+	return &Stats{records: records, tenant: tenant, now: now, pending: map[string]*statsEntry{}}
 }
 
 // Record adds one resolution. Called after the bytes are on their way out, not
 // before: a request that failed to serve is not a resolution.
-func (s *Stats) Record(tenant, tokenHash, ownerPrincipal, namespace string, bytesServed int64) {
+func (s *Stats) Record(tokenHash, ownerPrincipal, namespace string, bytesServed int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.pending[tokenHash]
 	if e == nil {
-		e = &statsEntry{tenant: tenant, ownerPrincipal: ownerPrincipal, namespace: namespace}
+		e = &statsEntry{ownerPrincipal: ownerPrincipal, namespace: namespace}
 		s.pending[tokenHash] = e
 	}
 	e.resolutions++
@@ -71,8 +71,7 @@ func (s *Stats) Record(tenant, tokenHash, ownerPrincipal, namespace string, byte
 	e.lastResolvedMs = s.now().UnixMilli()
 }
 
-// Flush writes every pending delta, each to its own tenant's store, and clears
-// it.
+// Flush writes every pending delta to the tenant's store, and clears it.
 //
 // READ-MODIFY-WRITE, not write. The other pod flushes the same row, so a blind
 // write would discard whatever it last contributed. Reading first, and writing
@@ -100,7 +99,7 @@ func (s *Stats) Flush(ctx context.Context) {
 }
 
 func (s *Stats) flushOne(ctx context.Context, tokenHash string, delta *statsEntry) error {
-	current, err := s.records.FetchLinkStats(ctx, delta.tenant, tokenHash)
+	current, err := s.records.FetchLinkStats(ctx, s.tenant, tokenHash)
 	if err != nil {
 		return err
 	}
@@ -121,9 +120,9 @@ func (s *Stats) flushOne(ctx context.Context, tokenHash string, delta *statsEntr
 	// the write is refused (ErrRecordExists, ErrRecordChanged) and the delta is
 	// kept for the next tick, which reads the other pod's flush and adds to it.
 	if current == nil {
-		return s.records.InsertLinkStats(ctx, delta.tenant, row)
+		return s.records.InsertLinkStats(ctx, s.tenant, row)
 	}
-	return s.records.ReplaceLinkStats(ctx, delta.tenant, current, row)
+	return s.records.ReplaceLinkStats(ctx, s.tenant, current, row)
 }
 
 // restore merges a failed delta back into pending, adding to whatever arrived

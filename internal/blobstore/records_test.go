@@ -29,13 +29,21 @@ import (
 // the rows reach the store through its write surface and nothing else.
 
 // fakeStratum is stratum's write surface, Get and Watch<T>Changes over a map.
+//
+// IT IS ROUTED AS THE TENANT-OWNED STORE IS (tacplus-dev/tacplus#207): every
+// call names its target_tenant, a row is kept and found only under the tenant
+// it was written to, and a written row whose namespace is not
+// /tenants/<target_tenant> is refused PERMISSION_DENIED. routed is every
+// target_tenant a call named, in order, so a test can see that none went
+// anywhere else.
 type fakeStratum struct {
 	query_pb.UnimplementedRecordMapServer
 
 	mu       sync.Mutex
-	rows     map[string]proto.Message // "<record type>/<key>"
+	rows     map[string]proto.Message // "<tenant>|<record type>/<key>"
 	revision int64
-	watchers map[string][]chan fakeChange // by record type
+	watchers map[string][]chan fakeChange // "<tenant>|<record type>"
+	routed   []string
 
 	// redoDown is the redo service unreachable: stratum refuses every write
 	// with UNAVAILABLE and still serves reads from memory.
@@ -60,23 +68,28 @@ func newFakeStratum() *fakeStratum {
 	return &fakeStratum{rows: map[string]proto.Message{}, watchers: map[string][]chan fakeChange{}}
 }
 
-func (f *fakeStratum) get(typ, key string) (proto.Message, int64, error) {
+func (f *fakeStratum) get(tenant, typ, key string) (proto.Message, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	row, ok := f.rows[typ+"/"+key]
+	f.routed = append(f.routed, tenant)
+	row, ok := f.rows[tenant+"|"+typ+"/"+key]
 	if !ok {
 		return nil, 0, status.Errorf(codes.NotFound, "%s %s not found", typ, key)
 	}
 	return proto.Clone(row), f.revision, nil
 }
 
-func (f *fakeStratum) write(typ, key string, op fakeWrite, row, expected proto.Message) (*query_pb.RecordWriteResult, error) {
+func (f *fakeStratum) write(tenant, typ, key string, op fakeWrite, row, expected proto.Message) (*query_pb.RecordWriteResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.routed = append(f.routed, tenant)
+	if ns := row.(namespaced).GetNamespace(); !inTenant(tenant, ns) {
+		return nil, status.Errorf(codes.PermissionDenied, "row of %q is not in tenant %q", ns, tenant)
+	}
 	if f.redoDown {
 		return nil, status.Error(codes.Unavailable, "redo is unreachable: writes are refused")
 	}
-	id := typ + "/" + key
+	id := tenant + "|" + typ + "/" + key
 	stored, present := f.rows[id]
 	kind := query_pb.RecordChangeType_RECORD_CHANGE_TYPE_MODIFY
 	switch op {
@@ -99,7 +112,7 @@ func (f *fakeStratum) write(typ, key string, op fakeWrite, row, expected proto.M
 	}
 	f.revision++
 	f.rows[id] = proto.Clone(row)
-	for _, w := range f.watchers[typ] {
+	for _, w := range f.watchers[tenant+"|"+typ] {
 		w <- fakeChange{kind: kind, row: proto.Clone(row), revision: f.revision}
 	}
 	return &query_pb.RecordWriteResult{Revision: f.revision, Durability: query_pb.RecordDurability_RECORD_DURABILITY_LOCAL}, nil
@@ -107,19 +120,20 @@ func (f *fakeStratum) write(typ, key string, op fakeWrite, row, expected proto.M
 
 // watch sends the snapshot of one record type, snapshot_done, then every write
 // until the caller goes away: the generated WATCH collection shape.
-func watchFake[E any](f *fakeStratum, typ string, stream grpc.ServerStreamingServer[E],
+func watchFake[E any](f *fakeStratum, tenant, typ string, stream grpc.ServerStreamingServer[E],
 	snapshot func(proto.Message) *E, done func(int64) *E, delta func(fakeChange) *E,
 ) error {
 	ch := make(chan fakeChange, 16)
 	f.mu.Lock()
+	f.routed = append(f.routed, tenant)
 	var rows []proto.Message
 	for id, row := range f.rows {
-		if strings.HasPrefix(id, typ+"/") {
+		if strings.HasPrefix(id, tenant+"|"+typ+"/") {
 			rows = append(rows, proto.Clone(row))
 		}
 	}
 	revision := f.revision
-	f.watchers[typ] = append(f.watchers[typ], ch)
+	f.watchers[tenant+"|"+typ] = append(f.watchers[tenant+"|"+typ], ch)
 	f.mu.Unlock()
 
 	for _, row := range rows {
@@ -143,7 +157,7 @@ func watchFake[E any](f *fakeStratum, typ string, stream grpc.ServerStreamingSer
 }
 
 func (f *fakeStratum) GetBlob(_ context.Context, req *query_pb.GetBlobRequest) (*query_pb.GetBlobResponse, error) {
-	row, rev, err := f.get("blobstore.Blob", req.GetBlobId())
+	row, rev, err := f.get(req.GetTargetTenant(), "blobstore.Blob", req.GetBlobId())
 	if err != nil {
 		return nil, err
 	}
@@ -151,19 +165,19 @@ func (f *fakeStratum) GetBlob(_ context.Context, req *query_pb.GetBlobRequest) (
 }
 
 func (f *fakeStratum) PutBlob(_ context.Context, req *query_pb.PutBlobRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.Blob", req.GetItem().GetBlobId(), fakePut, req.GetItem(), nil)
+	return f.write(req.GetTargetTenant(), "blobstore.Blob", req.GetItem().GetBlobId(), fakePut, req.GetItem(), nil)
 }
 
 func (f *fakeStratum) InsertIfAbsentBlob(_ context.Context, req *query_pb.InsertIfAbsentBlobRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.Blob", req.GetItem().GetBlobId(), fakeInsertIfAbsent, req.GetItem(), nil)
+	return f.write(req.GetTargetTenant(), "blobstore.Blob", req.GetItem().GetBlobId(), fakeInsertIfAbsent, req.GetItem(), nil)
 }
 
 func (f *fakeStratum) ReplaceIfUnchangedBlob(_ context.Context, req *query_pb.ReplaceIfUnchangedBlobRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.Blob", req.GetItem().GetBlobId(), fakeReplaceIfUnchanged, req.GetItem(), req.GetExpectedItem())
+	return f.write(req.GetTargetTenant(), "blobstore.Blob", req.GetItem().GetBlobId(), fakeReplaceIfUnchanged, req.GetItem(), req.GetExpectedItem())
 }
 
-func (f *fakeStratum) WatchBlobChanges(_ *query_pb.WatchBlobChangesRequest, stream grpc.ServerStreamingServer[query_pb.BlobWatchEvent]) error {
-	return watchFake(f, "blobstore.Blob", stream,
+func (f *fakeStratum) WatchBlobChanges(req *query_pb.WatchBlobChangesRequest, stream grpc.ServerStreamingServer[query_pb.BlobWatchEvent]) error {
+	return watchFake(f, req.GetTargetTenant(), "blobstore.Blob", stream,
 		func(m proto.Message) *query_pb.BlobWatchEvent {
 			return &query_pb.BlobWatchEvent{Event: &query_pb.BlobWatchEvent_SnapshotItem{SnapshotItem: m.(*blobstore_pb.Blob)}}
 		},
@@ -178,7 +192,7 @@ func (f *fakeStratum) WatchBlobChanges(_ *query_pb.WatchBlobChangesRequest, stre
 }
 
 func (f *fakeStratum) GetUploadSession(_ context.Context, req *query_pb.GetUploadSessionRequest) (*query_pb.GetUploadSessionResponse, error) {
-	row, rev, err := f.get("blobstore.UploadSession", req.GetUploadId())
+	row, rev, err := f.get(req.GetTargetTenant(), "blobstore.UploadSession", req.GetUploadId())
 	if err != nil {
 		return nil, err
 	}
@@ -186,19 +200,19 @@ func (f *fakeStratum) GetUploadSession(_ context.Context, req *query_pb.GetUploa
 }
 
 func (f *fakeStratum) PutUploadSession(_ context.Context, req *query_pb.PutUploadSessionRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.UploadSession", req.GetItem().GetUploadId(), fakePut, req.GetItem(), nil)
+	return f.write(req.GetTargetTenant(), "blobstore.UploadSession", req.GetItem().GetUploadId(), fakePut, req.GetItem(), nil)
 }
 
 func (f *fakeStratum) InsertIfAbsentUploadSession(_ context.Context, req *query_pb.InsertIfAbsentUploadSessionRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.UploadSession", req.GetItem().GetUploadId(), fakeInsertIfAbsent, req.GetItem(), nil)
+	return f.write(req.GetTargetTenant(), "blobstore.UploadSession", req.GetItem().GetUploadId(), fakeInsertIfAbsent, req.GetItem(), nil)
 }
 
 func (f *fakeStratum) ReplaceIfUnchangedUploadSession(_ context.Context, req *query_pb.ReplaceIfUnchangedUploadSessionRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.UploadSession", req.GetItem().GetUploadId(), fakeReplaceIfUnchanged, req.GetItem(), req.GetExpectedItem())
+	return f.write(req.GetTargetTenant(), "blobstore.UploadSession", req.GetItem().GetUploadId(), fakeReplaceIfUnchanged, req.GetItem(), req.GetExpectedItem())
 }
 
-func (f *fakeStratum) WatchUploadSessionChanges(_ *query_pb.WatchUploadSessionChangesRequest, stream grpc.ServerStreamingServer[query_pb.UploadSessionWatchEvent]) error {
-	return watchFake(f, "blobstore.UploadSession", stream,
+func (f *fakeStratum) WatchUploadSessionChanges(req *query_pb.WatchUploadSessionChangesRequest, stream grpc.ServerStreamingServer[query_pb.UploadSessionWatchEvent]) error {
+	return watchFake(f, req.GetTargetTenant(), "blobstore.UploadSession", stream,
 		func(m proto.Message) *query_pb.UploadSessionWatchEvent {
 			return &query_pb.UploadSessionWatchEvent{Event: &query_pb.UploadSessionWatchEvent_SnapshotItem{SnapshotItem: m.(*blobstore_pb.UploadSession)}}
 		},
@@ -213,7 +227,7 @@ func (f *fakeStratum) WatchUploadSessionChanges(_ *query_pb.WatchUploadSessionCh
 }
 
 func (f *fakeStratum) GetBlobLink(_ context.Context, req *query_pb.GetBlobLinkRequest) (*query_pb.GetBlobLinkResponse, error) {
-	row, rev, err := f.get("blobstore.BlobLink", req.GetTokenHash())
+	row, rev, err := f.get(req.GetTargetTenant(), "blobstore.BlobLink", req.GetTokenHash())
 	if err != nil {
 		return nil, err
 	}
@@ -221,19 +235,19 @@ func (f *fakeStratum) GetBlobLink(_ context.Context, req *query_pb.GetBlobLinkRe
 }
 
 func (f *fakeStratum) PutBlobLink(_ context.Context, req *query_pb.PutBlobLinkRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.BlobLink", req.GetItem().GetTokenHash(), fakePut, req.GetItem(), nil)
+	return f.write(req.GetTargetTenant(), "blobstore.BlobLink", req.GetItem().GetTokenHash(), fakePut, req.GetItem(), nil)
 }
 
 func (f *fakeStratum) InsertIfAbsentBlobLink(_ context.Context, req *query_pb.InsertIfAbsentBlobLinkRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.BlobLink", req.GetItem().GetTokenHash(), fakeInsertIfAbsent, req.GetItem(), nil)
+	return f.write(req.GetTargetTenant(), "blobstore.BlobLink", req.GetItem().GetTokenHash(), fakeInsertIfAbsent, req.GetItem(), nil)
 }
 
 func (f *fakeStratum) ReplaceIfUnchangedBlobLink(_ context.Context, req *query_pb.ReplaceIfUnchangedBlobLinkRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.BlobLink", req.GetItem().GetTokenHash(), fakeReplaceIfUnchanged, req.GetItem(), req.GetExpectedItem())
+	return f.write(req.GetTargetTenant(), "blobstore.BlobLink", req.GetItem().GetTokenHash(), fakeReplaceIfUnchanged, req.GetItem(), req.GetExpectedItem())
 }
 
-func (f *fakeStratum) WatchBlobLinkChanges(_ *query_pb.WatchBlobLinkChangesRequest, stream grpc.ServerStreamingServer[query_pb.BlobLinkWatchEvent]) error {
-	return watchFake(f, "blobstore.BlobLink", stream,
+func (f *fakeStratum) WatchBlobLinkChanges(req *query_pb.WatchBlobLinkChangesRequest, stream grpc.ServerStreamingServer[query_pb.BlobLinkWatchEvent]) error {
+	return watchFake(f, req.GetTargetTenant(), "blobstore.BlobLink", stream,
 		func(m proto.Message) *query_pb.BlobLinkWatchEvent {
 			return &query_pb.BlobLinkWatchEvent{Event: &query_pb.BlobLinkWatchEvent_SnapshotItem{SnapshotItem: m.(*blobstore_pb.BlobLink)}}
 		},
@@ -248,7 +262,7 @@ func (f *fakeStratum) WatchBlobLinkChanges(_ *query_pb.WatchBlobLinkChangesReque
 }
 
 func (f *fakeStratum) GetBlobLinkStats(_ context.Context, req *query_pb.GetBlobLinkStatsRequest) (*query_pb.GetBlobLinkStatsResponse, error) {
-	row, rev, err := f.get("blobstore.BlobLinkStats", req.GetTokenHash())
+	row, rev, err := f.get(req.GetTargetTenant(), "blobstore.BlobLinkStats", req.GetTokenHash())
 	if err != nil {
 		return nil, err
 	}
@@ -256,19 +270,19 @@ func (f *fakeStratum) GetBlobLinkStats(_ context.Context, req *query_pb.GetBlobL
 }
 
 func (f *fakeStratum) PutBlobLinkStats(_ context.Context, req *query_pb.PutBlobLinkStatsRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.BlobLinkStats", req.GetItem().GetTokenHash(), fakePut, req.GetItem(), nil)
+	return f.write(req.GetTargetTenant(), "blobstore.BlobLinkStats", req.GetItem().GetTokenHash(), fakePut, req.GetItem(), nil)
 }
 
 func (f *fakeStratum) InsertIfAbsentBlobLinkStats(_ context.Context, req *query_pb.InsertIfAbsentBlobLinkStatsRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.BlobLinkStats", req.GetItem().GetTokenHash(), fakeInsertIfAbsent, req.GetItem(), nil)
+	return f.write(req.GetTargetTenant(), "blobstore.BlobLinkStats", req.GetItem().GetTokenHash(), fakeInsertIfAbsent, req.GetItem(), nil)
 }
 
 func (f *fakeStratum) ReplaceIfUnchangedBlobLinkStats(_ context.Context, req *query_pb.ReplaceIfUnchangedBlobLinkStatsRequest) (*query_pb.RecordWriteResult, error) {
-	return f.write("blobstore.BlobLinkStats", req.GetItem().GetTokenHash(), fakeReplaceIfUnchanged, req.GetItem(), req.GetExpectedItem())
+	return f.write(req.GetTargetTenant(), "blobstore.BlobLinkStats", req.GetItem().GetTokenHash(), fakeReplaceIfUnchanged, req.GetItem(), req.GetExpectedItem())
 }
 
-func (f *fakeStratum) WatchBlobLinkStatsChanges(_ *query_pb.WatchBlobLinkStatsChangesRequest, stream grpc.ServerStreamingServer[query_pb.BlobLinkStatsWatchEvent]) error {
-	return watchFake(f, "blobstore.BlobLinkStats", stream,
+func (f *fakeStratum) WatchBlobLinkStatsChanges(req *query_pb.WatchBlobLinkStatsChangesRequest, stream grpc.ServerStreamingServer[query_pb.BlobLinkStatsWatchEvent]) error {
+	return watchFake(f, req.GetTargetTenant(), "blobstore.BlobLinkStats", stream,
 		func(m proto.Message) *query_pb.BlobLinkStatsWatchEvent {
 			return &query_pb.BlobLinkStatsWatchEvent{Event: &query_pb.BlobLinkStatsWatchEvent_SnapshotItem{SnapshotItem: m.(*blobstore_pb.BlobLinkStats)}}
 		},
@@ -282,14 +296,14 @@ func (f *fakeStratum) WatchBlobLinkStatsChanges(_ *query_pb.WatchBlobLinkStatsCh
 		})
 }
 
-// waitWatching waits until a watch of typ is registered on the server, so a write
-// made after it is a change and not part of the snapshot.
-func (f *fakeStratum) waitWatching(t *testing.T, typ string) {
+// waitWatching waits until a watch of typ in tenant is registered on the server,
+// so a write made after it is a change and not part of the snapshot.
+func (f *fakeStratum) waitWatching(t *testing.T, tenant, typ string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		f.mu.Lock()
-		n := len(f.watchers[typ])
+		n := len(f.watchers[tenant+"|"+typ])
 		f.mu.Unlock()
 		if n > 0 {
 			return
@@ -367,7 +381,7 @@ func recordCasesFor(tenant string) []recordCase {
 	hash := strings.Repeat("ab", 32)
 	tokenHash := strings.Repeat("cd", 32)
 	blob := &blobstore_pb.Blob{
-		BlobId: BlobKey{Group: testGroup, Namespace: testNS, Hash: hash}.String(), Group: testGroup, ContentHash: hash,
+		BlobId: BlobKey{Group: testGroup, Hash: hash}.String(), Group: testGroup, ContentHash: hash,
 		SizeBytes: 9, ContentType: "application/pdf", CreatedMs: 1, OwnerPrincipal: "docmanager", Namespace: testNS,
 	}
 	deletedBlob := proto.Clone(blob).(*blobstore_pb.Blob)
@@ -513,12 +527,12 @@ func TestRecordsWriteReadAndWatchEachRecordType(t *testing.T) {
 			}
 			next, stop := iter.Pull2(feed)
 			defer stop()
-			fake.waitWatching(t, "blobstore."+tc.name)
+			fake.waitWatching(t, testTenant, "blobstore."+tc.name)
 
 			if err := tc.insert(ctx, records, tc.row); err != nil {
 				t.Fatalf("write: %v", err)
 			}
-			if _, _, err := fake.get("blobstore."+tc.name, keyOf(tc.row)); err != nil {
+			if _, _, err := fake.get(testTenant, "blobstore."+tc.name, keyOf(tc.row)); err != nil {
 				t.Fatalf("the write did not reach the store's write surface: %v", err)
 			}
 			got, err := tc.read(ctx, records)

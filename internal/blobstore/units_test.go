@@ -173,29 +173,29 @@ func TestDuplicateGroupNamesAreRefused(t *testing.T) {
 	}
 }
 
-// The blob key is the one place a wire string becomes a path.
+// The blob key is the one place a wire string becomes a path. It is
+// `<group>/<sha256>`: the instance is the tenant's, so no namespace is in it (#9).
 func TestBlobKeyRoundTripsAndRefusesTraversal(t *testing.T) {
-	for _, ns := range []string{"/", "/tenants/acme", "/tenants/acme/team-a"} {
-		k := BlobKey{Group: "documents", Namespace: ns, Hash: strings.Repeat("a", 64)}
-		back, err := ParseBlobKey(k.String())
-		if err != nil {
-			t.Fatalf("ParseBlobKey(%q): %v", k.String(), err)
-		}
-		if back != k {
-			t.Fatalf("round trip: got %+v, want %+v", back, k)
-		}
-		if n := strings.Count(k.String(), "/"); n != 2 {
-			t.Fatalf("blob_id %q has %d separators, want the three-segment form", k.String(), n)
-		}
+	k := BlobKey{Group: "documents", Hash: strings.Repeat("a", 64)}
+	back, err := ParseBlobKey(k.String())
+	if err != nil {
+		t.Fatalf("ParseBlobKey(%q): %v", k.String(), err)
+	}
+	if back != k {
+		t.Fatalf("round trip: got %+v, want %+v", back, k)
+	}
+	if want := "documents/" + strings.Repeat("a", 64); k.String() != want {
+		t.Fatalf("blob_id %q, want %q", k.String(), want)
 	}
 	for name, bad := range map[string]string{
-		"traversal group":     "../../etc/:tenants:acme/" + strings.Repeat("a", 64),
-		"traversal namespace": "documents/../../" + strings.Repeat("a", 64),
-		"short hash":          "documents/:tenants:acme/abc",
-		"uppercase hash":      "documents/:tenants:acme/" + strings.Repeat("A", 64),
-		"non-hex hash":        "documents/:tenants:acme/" + strings.Repeat("z", 64),
-		"too few segments":    "documents/" + strings.Repeat("a", 64),
-		"relative namespace":  "documents/tenants:acme/" + strings.Repeat("a", 64),
+		"traversal group":     "../" + strings.Repeat("a", 64),
+		"traversal hash":      "documents/..",
+		"short hash":          "documents/abc",
+		"uppercase hash":      "documents/" + strings.Repeat("A", 64),
+		"non-hex hash":        "documents/" + strings.Repeat("z", 64),
+		"a namespace segment": "documents/:tenants:acme/" + strings.Repeat("a", 64),
+		"too few segments":    strings.Repeat("a", 64),
+		"an empty group":      "/" + strings.Repeat("a", 64),
 	} {
 		if _, err := ParseBlobKey(bad); err == nil {
 			t.Errorf("%s: %q was accepted", name, bad)

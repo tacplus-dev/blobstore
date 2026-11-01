@@ -16,14 +16,11 @@ import (
 const hexSHA256Len = 64
 
 // validateBlobKey is the gate between the wire and the filesystem. Everything
-// that turns a caller-supplied group, namespace or hash into a path goes through
-// it — Store.Path's own doc comment says so — so a traversal attempt is refused
-// at one place rather than defended against at each call site.
-func validateBlobKey(group, namespace, hash string) error {
+// that turns a caller-supplied group or hash into a path goes through it —
+// Store.Path's own doc comment says so — so a traversal attempt is refused at
+// one place rather than defended against at each call site.
+func validateBlobKey(group, hash string) error {
 	if err := validateGroupName(group); err != nil {
-		return err
-	}
-	if err := validateNamespace(namespace); err != nil {
 		return err
 	}
 	return validateContentHash(hash)
@@ -47,40 +44,6 @@ func validateGroupName(group string) error {
 	return nil
 }
 
-// validateNamespace accepts the fleet's namespace form: an absolute path of
-// segments, each letters, digits, `-` or `_` ("/" for root, "/tenants/acme" for
-// a tenant). It refuses "." and ".." as segments explicitly rather than relying
-// on the character set, because both are made only of accepted characters and
-// both are exactly what a traversal needs.
-func validateNamespace(namespace string) error {
-	if namespace == "" {
-		return fmt.Errorf("namespace is empty")
-	}
-	if !strings.HasPrefix(namespace, "/") {
-		return fmt.Errorf("namespace %q is not absolute", namespace)
-	}
-	if len(namespace) > 256 {
-		return fmt.Errorf("namespace %q is longer than 256 characters", namespace)
-	}
-	if namespace == "/" {
-		return nil
-	}
-	for _, seg := range strings.Split(strings.TrimPrefix(namespace, "/"), "/") {
-		if seg == "" {
-			return fmt.Errorf("namespace %q has an empty segment", namespace)
-		}
-		if seg == "." || seg == ".." {
-			return fmt.Errorf("namespace %q has a relative segment", namespace)
-		}
-		for _, r := range seg {
-			if !isNameRune(r) {
-				return fmt.Errorf("namespace %q contains %q, which is not a letter, digit, '-' or '_'", namespace, r)
-			}
-		}
-	}
-	return nil
-}
-
 // validateContentHash accepts exactly a lowercase hex SHA-256.
 func validateContentHash(h string) error {
 	if len(h) != hexSHA256Len {
@@ -96,17 +59,6 @@ func validateContentHash(h string) error {
 
 func isNameRune(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
-}
-
-// namespaceDir encodes a namespace path as one filesystem segment. See
-// BlobKey.String for why `:` is the substitute and why it is total.
-func namespaceDir(namespace string) string {
-	return strings.ReplaceAll(namespace, "/", ":")
-}
-
-// namespaceFromDir is namespaceDir's inverse.
-func namespaceFromDir(dir string) string {
-	return strings.ReplaceAll(dir, ":", "/")
 }
 
 // sanitizeTempPrefix reduces an upload id to something safe to use as a temp

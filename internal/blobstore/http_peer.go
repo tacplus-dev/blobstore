@@ -11,7 +11,7 @@ import (
 // PeerHandler is the mirror-and-anti-entropy listener (R2).
 //
 // IT IS A SEPARATE LISTENER, not more prefixes on the public one, because
-// /peer/hashes enumerates every blob this pod holds for every tenant. The gateway
+// /peer/hashes enumerates every blob this pod holds. The gateway
 // proxies only /upload/ and /b/, so this port has no route from outside the
 // cluster at all.
 //
@@ -35,8 +35,8 @@ func (s *Service) PeerHandler() http.Handler {
 	return mux
 }
 
-// servePeerHashes answers the anti-entropy listing: one `<group>/<ns>/<sha256>`
-// per line.
+// servePeerHashes answers the anti-entropy listing: one `<group>/<sha256>` per
+// line.
 //
 // The format is deliberately the blob_id form and nothing else — no sizes, no
 // timestamps, no JSON. A peer filling a replaced disk needs exactly the set of
@@ -69,7 +69,7 @@ func (s *Service) servePeerBlob(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		f, info, err := s.store.Open(key.Group, key.Namespace, key.Hash)
+		f, info, err := s.store.Open(key.Group, key.Hash)
 		if err != nil {
 			http.NotFound(w, r)
 			return
@@ -80,7 +80,7 @@ func (s *Service) servePeerBlob(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		// Idempotent: Store.Remove treats a missing file as done, because
 		// DeleteBlob may be retried and the peer may already have unlinked it.
-		if err := s.store.Remove(key.Group, key.Namespace, key.Hash); err != nil {
+		if err := s.store.Remove(key.Group, key.Hash); err != nil {
 			zap.L().Error("failed to remove a blob for the peer", zap.Error(err))
 			http.Error(w, "", http.StatusInternalServerError)
 			return
@@ -116,12 +116,12 @@ func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, rest s
 	// trusted: this pod resolves the token itself rather than believing terms
 	// another pod sent it. The cost is one stratum read per mirrored upload —
 	// which is new, and is what the old self-describing token bought.
-	tenant, token, ok := bearerPath(rest)
+	token, ok := s.bearerPath(rest)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	session, err := s.records.FetchSession(r.Context(), tenant, UploadTokenHash(token))
+	session, err := s.records.FetchSession(r.Context(), s.tenant, UploadTokenHash(token))
 	if err != nil {
 		http.Error(w, "", http.StatusServiceUnavailable)
 		return
@@ -130,7 +130,7 @@ func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, rest s
 		http.NotFound(w, r)
 		return
 	}
-	if err := validateBlobKey(session.GetGroup(), session.GetNamespace(), session.GetContentHash()); err != nil {
+	if err := validateBlobKey(session.GetGroup(), session.GetContentHash()); err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -181,7 +181,7 @@ func (s *Service) servePeerUpload(w http.ResponseWriter, r *http.Request, rest s
 	// Promote BEFORE answering: the answer is what tells the other pod the bytes
 	// are fsynced and in place here, and that is what it waits for before
 	// promoting its own copy (R9 step 3).
-	if err := s.store.Promote(tmp, session.GetGroup(), session.GetNamespace(), session.GetContentHash()); err != nil {
+	if err := s.store.Promote(tmp, session.GetGroup(), session.GetContentHash()); err != nil {
 		zap.L().Error("failed to promote a mirrored upload", zap.Error(err))
 		http.Error(w, "", http.StatusInternalServerError)
 		return

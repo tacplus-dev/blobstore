@@ -30,18 +30,17 @@ import (
 
 const testGroup = "documents"
 
-// pair is two pods that mirror to each other.
+// pair is two pods that mirror to each other: one tenant's instance, with its
+// own Stratum (records). Two tenants are two pairs.
 type pair struct {
-	a, b    *Service
-	aBytes  *httptest.Server
-	bBytes  *httptest.Server
-	aPeer   *httptest.Server
-	bPeer   *httptest.Server
-	records *fakeRecords
-	nowMs   int64
-	// tenants is what the sweep walks: the tenants kernel would report a
-	// Stratum for.
-	tenants    []string
+	tenant     string
+	a, b       *Service
+	aBytes     *httptest.Server
+	bBytes     *httptest.Server
+	aPeer      *httptest.Server
+	bPeer      *httptest.Server
+	records    *fakeRecords
+	nowMs      int64
 	aPeerRoute *routableHandler
 	bPeerRoute *routableHandler
 }
@@ -73,12 +72,16 @@ func (r *routableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	h.ServeHTTP(w, req)
 }
 
-func newPair(t *testing.T) *pair {
+// newPair is testTenant's instance.
+func newPair(t *testing.T) *pair { return newTenantPair(t, testTenant) }
+
+// newTenantPair is one tenant's instance: its two pods, its disks, its Stratum.
+func newTenantPair(t *testing.T, tenant string) *pair {
 	t.Helper()
 	p := &pair{
+		tenant:     tenant,
 		records:    newFakeRecords(),
 		nowMs:      1_700_000_000_000,
-		tenants:    []string{testTenant},
 		aPeerRoute: &routableHandler{},
 		bPeerRoute: &routableHandler{},
 	}
@@ -99,6 +102,9 @@ func newPair(t *testing.T) *pair {
 	return p
 }
 
+// ns is the instance's tenant's namespace, /tenants/<tid>.
+func (p *pair) ns() string { return "/tenants/" + p.tenant }
+
 // newPod builds one Service over a fresh temp directory.
 //
 // `self` is a synthetic hostname rather than the machine's, so NewMirror's
@@ -116,7 +122,7 @@ func (p *pair) newPod(t *testing.T, self, selfAddr, peerAddr string) *Service {
 	if err != nil {
 		t.Fatalf("NewMirror: %v", err)
 	}
-	svc := NewService(store, mirror, p.records, func() []string { return p.tenants }, func() time.Time {
+	svc := NewService(store, mirror, p.records, p.tenant, func() time.Time {
 		return time.UnixMilli(p.nowMs)
 	})
 	if err := svc.Configure(testConfig()); err != nil {
@@ -189,7 +195,13 @@ func put(t *testing.T, srv *httptest.Server, token string, body []byte) int {
 // putPath streams a body to a path of one pod's public listener.
 func putPath(t *testing.T, srv *httptest.Server, path string, body []byte) int {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPut, srv.URL+path, bytes.NewReader(body))
+	return putURL(t, srv.URL+path, body)
+}
+
+// putURL streams a body to a URL and returns the status code.
+func putURL(t *testing.T, url string, body []byte) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("building PUT: %v", err)
 	}
@@ -226,6 +238,42 @@ type fakeRecords struct {
 	// beforeWrite, when set, runs once before the next write takes the lock: it
 	// is how a test makes another writer get there between a read and a write.
 	beforeWrite func()
+	// routed is the tenant every call named, in order.
+	routed []string
+}
+
+// snapshot is every row the store holds, by type and key, for a test that
+// checks a refused call changed nothing.
+func (f *fakeRecords) snapshot() map[string]proto.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]proto.Message{}
+	for k, r := range f.blobs {
+		out["Blob/"+k] = proto.Clone(r)
+	}
+	for k, r := range f.links {
+		out["BlobLink/"+k] = proto.Clone(r)
+	}
+	for k, r := range f.sessions {
+		out["UploadSession/"+k] = proto.Clone(r)
+	}
+	for k, r := range f.stats {
+		out["BlobLinkStats/"+k] = proto.Clone(r)
+	}
+	return out
+}
+
+// routedOutside is every call that named a tenant other than tenant.
+func (f *fakeRecords) routedOutside(tenant string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, tid := range f.routed {
+		if tid != tenant {
+			out = append(out, tid)
+		}
+	}
+	return out
 }
 
 // interleave runs and clears beforeWrite.
@@ -259,13 +307,15 @@ func (f *fakeRecords) putSession(s *blobstore_pb.UploadSession) {
 	f.sessions[s.GetUploadId()] = s
 }
 
-// The fake is one store per tenant, as Stratum is: rows are kept in one map per
-// type (their keys do not collide across tenants), but a call reaches only the
-// rows of the tenant it names. Another tenant's row reads as absent, a write of a
+// The fake is one tenant's Stratum, and a test of two tenants has two. A call
+// still names its tenant, as the plane's target_tenant does, and is checked as
+// the store checks it: a row of another tenant reads as absent, a write of a
 // row outside the named tenant is refused as the store's route check refuses it
 // (PERMISSION_DENIED), and a call that names no tenant is refused before it is
-// sent, as the generated client refuses it.
-func fakeRoute(tenant string) error {
+// sent, as the generated client refuses it. Every tenant a call named is kept in
+// routed.
+func (f *fakeRecords) route(tenant string) error {
+	f.routed = append(f.routed, tenant)
 	if !ValidTenantID(tenant) {
 		return fmt.Errorf("fake stratum: call names no tenant (%q): %w", tenant, ErrRecordOutsideTenant)
 	}
@@ -274,7 +324,7 @@ func fakeRoute(tenant string) error {
 
 func fakeRead[T interface{ GetNamespace() string }](f *fakeRecords, tenant string, row T) (T, error) {
 	var none T
-	if err := fakeRoute(tenant); err != nil {
+	if err := f.route(tenant); err != nil {
 		return none, err
 	}
 	if f.failReads {
@@ -287,7 +337,7 @@ func fakeRead[T interface{ GetNamespace() string }](f *fakeRecords, tenant strin
 }
 
 func fakeList[T interface{ GetNamespace() string }](f *fakeRecords, tenant string, rows map[string]T, keep func(T) bool) ([]T, error) {
-	if err := fakeRoute(tenant); err != nil {
+	if err := f.route(tenant); err != nil {
 		return nil, err
 	}
 	if f.failReads {
@@ -302,8 +352,8 @@ func fakeList[T interface{ GetNamespace() string }](f *fakeRecords, tenant strin
 	return out, nil
 }
 
-func fakeWritable(tenant string, rows ...interface{ GetNamespace() string }) error {
-	if err := fakeRoute(tenant); err != nil {
+func (f *fakeRecords) writable(tenant string, rows ...interface{ GetNamespace() string }) error {
+	if err := f.route(tenant); err != nil {
 		return err
 	}
 	for _, row := range rows {
@@ -320,11 +370,11 @@ func (f *fakeRecords) FetchBlob(_ context.Context, tenant, blobID string) (*blob
 	return fakeRead(f, tenant, f.blobs[blobID])
 }
 
-func (f *fakeRecords) ListBlobsInGroup(_ context.Context, tenant, group, namespace string) ([]*blobstore_pb.Blob, error) {
+func (f *fakeRecords) ListBlobsInGroup(_ context.Context, tenant, group string) ([]*blobstore_pb.Blob, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out, err := fakeList(f, tenant, f.blobs, func(b *blobstore_pb.Blob) bool {
-		return b.GetGroup() == group && b.GetNamespace() == namespace
+		return b.GetGroup() == group
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].GetBlobId() < out[j].GetBlobId() })
 	return out, err
@@ -372,7 +422,7 @@ func (f *fakeRecords) PutBlob(_ context.Context, tenant string, rec *blobstore_p
 	f.interleave()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := fakeWritable(tenant, rec); err != nil {
+	if err := f.writable(tenant, rec); err != nil {
 		return err
 	}
 	if f.failWrites {
@@ -386,7 +436,7 @@ func (f *fakeRecords) ReplaceBlob(_ context.Context, tenant string, prev, next *
 	f.interleave()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := fakeWritable(tenant, prev, next); err != nil {
+	if err := f.writable(tenant, prev, next); err != nil {
 		return err
 	}
 	return fakeReplace(f.failWrites, f.blobs, next.GetBlobId(), prev, next)
@@ -396,7 +446,7 @@ func (f *fakeRecords) InsertSession(_ context.Context, tenant string, rec *blobs
 	f.interleave()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := fakeWritable(tenant, rec); err != nil {
+	if err := f.writable(tenant, rec); err != nil {
 		return err
 	}
 	return fakeInsert(f.failWrites, f.sessions, rec.GetUploadId(), rec)
@@ -406,7 +456,7 @@ func (f *fakeRecords) ReplaceSession(_ context.Context, tenant string, prev, nex
 	f.interleave()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := fakeWritable(tenant, prev, next); err != nil {
+	if err := f.writable(tenant, prev, next); err != nil {
 		return err
 	}
 	return fakeReplace(f.failWrites, f.sessions, next.GetUploadId(), prev, next)
@@ -416,7 +466,7 @@ func (f *fakeRecords) InsertLink(_ context.Context, tenant string, rec *blobstor
 	f.interleave()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := fakeWritable(tenant, rec); err != nil {
+	if err := f.writable(tenant, rec); err != nil {
 		return err
 	}
 	return fakeInsert(f.failWrites, f.links, rec.GetTokenHash(), rec)
@@ -426,7 +476,7 @@ func (f *fakeRecords) ReplaceLink(_ context.Context, tenant string, prev, next *
 	f.interleave()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := fakeWritable(tenant, prev, next); err != nil {
+	if err := f.writable(tenant, prev, next); err != nil {
 		return err
 	}
 	return fakeReplace(f.failWrites, f.links, next.GetTokenHash(), prev, next)
@@ -436,7 +486,7 @@ func (f *fakeRecords) InsertLinkStats(_ context.Context, tenant string, rec *blo
 	f.interleave()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := fakeWritable(tenant, rec); err != nil {
+	if err := f.writable(tenant, rec); err != nil {
 		return err
 	}
 	return fakeInsert(f.failWrites, f.stats, rec.GetTokenHash(), rec)
@@ -446,7 +496,7 @@ func (f *fakeRecords) ReplaceLinkStats(_ context.Context, tenant string, prev, n
 	f.interleave()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := fakeWritable(tenant, prev, next); err != nil {
+	if err := f.writable(tenant, prev, next); err != nil {
 		return err
 	}
 	return fakeReplace(f.failWrites, f.stats, next.GetTokenHash(), prev, next)
@@ -496,7 +546,7 @@ func (p *pair) mintLinkNamed(t *testing.T, sess *blobstore_pb.UploadSession, fil
 	}
 	p.records.links[tokenHash] = &blobstore_pb.BlobLink{
 		TokenHash:      tokenHash,
-		BlobId:         BlobKey{Group: sess.GetGroup(), Namespace: sess.GetNamespace(), Hash: sess.GetContentHash()}.String(),
+		BlobId:         BlobKey{Group: sess.GetGroup(), Hash: sess.GetContentHash()}.String(),
 		Filename:       filename,
 		Policy:         blobstore_pb.LinkPolicy_LINK_POLICY_BEARER,
 		CreatedMs:      p.nowMs,
@@ -514,7 +564,7 @@ func (p *pair) get(t *testing.T, srv *httptest.Server, token string) *http.Respo
 
 func (p *pair) do(t *testing.T, method string, srv *httptest.Server, token string, header http.Header) *http.Response {
 	t.Helper()
-	return p.doPath(t, method, srv, BlobPath(testTenant, token), header)
+	return p.doPath(t, method, srv, BlobPath(p.tenant, token), header)
 }
 
 // doPath requests a path of one pod's public listener.
@@ -543,8 +593,8 @@ func bytesOf(s string) *bytes.Reader { return bytes.NewReader([]byte(s)) }
 // session, for the tests that need a blob to exist before they start.
 func (p *pair) uploadOne(t *testing.T) *blobstore_pb.UploadSession {
 	t.Helper()
-	token, sess := p.mintUpload(t, p.a, testNS, "application/pdf", pdfBody)
-	if got := put(t, p.aBytes, token, pdfBody); got != http.StatusCreated {
+	token, sess := p.mintUpload(t, p.a, p.ns(), "application/pdf", pdfBody)
+	if got := putPath(t, p.aBytes, UploadPath(p.tenant, token), pdfBody); got != http.StatusCreated {
 		t.Fatalf("setup upload: got %d, want 201", got)
 	}
 	return sess

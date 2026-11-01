@@ -43,13 +43,21 @@ func (h *Handler) Service() *Service { return h.svc }
 // not docmanager's pod. That is what goes in Blob.owner_principal, so ownership
 // survives a pod restart, a rescheduling and a location change.
 //
-// The tenant half of the check is already done before this handler runs: every RPC
-// declares (spec.rpc).target_namespace_field, so the generated authorizer has held
-// the caller to its own namespace or below. What is left for the handler is the
-// SERVICE half — that this caller is the one that owns this row (R6).
-func callerPrincipal(caller *servicemanager.Caller) (string, error) {
+// THE CALLER MUST BE OF THIS INSTANCE'S TENANT (#9). The generated door admits
+// callers at or above the tenant and in /system; target_namespace_field then
+// holds the caller to the request's namespace or above, which no /system caller
+// is. This is the same rule said once more, whatever the request names: a
+// caller whose namespace is not in /tenants/<tid> of this instance — /system, the
+// root, another tenant — is refused before a row is read. /system never holds,
+// serves or reaches a tenant's blobs. What is left after it is the SERVICE half:
+// that this caller is the one that owns this row (R6).
+func (h *Handler) callerPrincipal(caller *servicemanager.Caller) (string, error) {
 	if caller == nil || caller.Token() == nil {
 		return "", status.Error(codes.Unauthenticated, "no caller identity")
+	}
+	if !inTenant(h.svc.tenant, caller.Token().GetNamespace()) {
+		return "", status.Errorf(codes.PermissionDenied,
+			"caller namespace %q is not in this instance's tenant %s", caller.Token().GetNamespace(), h.svc.tenant)
 	}
 	path, err := caller.Token().ServicePath()
 	if err != nil {
@@ -71,15 +79,23 @@ func requireOwner(rowOwner, rowNamespace, caller, namespace, what string) error 
 	return nil
 }
 
-// requestTenant is the tenant an RPC's rows live under: the tid of the
-// request's namespace (/tenants/<tid>, or below it), whose Stratum every record
-// call of the RPC is routed to (#8). A namespace that is no tenant's is refused:
-// there is no store for its rows.
-func requestTenant(namespace string) (string, error) {
-	tenant, ok := NamespaceTenant(namespace)
-	if !ok {
+// requestTenant checks an RPC's route field and namespace against the instance
+// and returns the tenant its rows live under, whose Stratum every record call of
+// the RPC is routed to (#9).
+//
+// A request routed to another tenant is that tenant's instance's to answer: the
+// generated server refuses it before the handler (PERMISSION_DENIED), and so does
+// this. The namespace must be the tenant's own, /tenants/<tid>: the instance
+// keeps rows in no other, and its disks have no namespace level to keep them
+// apart.
+func (h *Handler) requestTenant(tenant, namespace string) (string, error) {
+	if tenant != h.svc.tenant {
+		return "", status.Errorf(codes.PermissionDenied,
+			"request routed to tenant %q reached the instance of tenant %s", tenant, h.svc.tenant)
+	}
+	if namespace != "/tenants/"+tenant {
 		return "", status.Errorf(codes.InvalidArgument,
-			"namespace %q is not a tenant's (/tenants/<tid>): blobstore keeps rows only in a tenant's own store", namespace)
+			"namespace %q is not tenant %s's (/tenants/%s): blobstore keeps rows only in its tenant's namespace", namespace, tenant, tenant)
 	}
 	return tenant, nil
 }
@@ -91,7 +107,7 @@ func requestTenant(namespace string) (string, error) {
 // CreateUpload is the doc's BeginUpload (R9 step 1), renamed for the closed verb
 // registry — see the service comment in blobstore.proto.
 func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.CreateUploadRequest) (*blobstore_pb.CreateUploadResponse, error) {
-	owner, err := callerPrincipal(caller)
+	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
 	}
@@ -99,12 +115,12 @@ func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Calle
 	if conf == nil {
 		return nil, status.Error(codes.Unavailable, "config has not been delivered")
 	}
-	if err := validateBlobKey(req.GetGroup(), req.GetNamespace(), req.GetContentHash()); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-	tenant, err := requestTenant(req.GetNamespace())
+	tenant, err := h.requestTenant(req.GetTenant(), req.GetNamespace())
 	if err != nil {
 		return nil, err
+	}
+	if err := validateBlobKey(req.GetGroup(), req.GetContentHash()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	vg, err := conf.groups.CheckDeclared(req.GetGroup(), req.GetContentType(), req.GetSizeBytes())
 	if err != nil {
@@ -124,7 +140,7 @@ func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Calle
 
 	// Reserve BEFORE minting the token: a token that exists without a reservation
 	// is permission to exceed the quota (R9 step 1).
-	if err := h.svc.quota.Reserve(ctx, tenant, uploadID, req.GetGroup(), req.GetNamespace(), req.GetSizeBytes(), vg.GetTenantQuotaBytes()); err != nil {
+	if err := h.svc.quota.Reserve(ctx, tenant, uploadID, req.GetGroup(), req.GetSizeBytes(), vg.GetTenantQuotaBytes()); err != nil {
 		// Over quota and "cannot read the store to find out" are different answers
 		// to the caller: the first is final and the second is worth retrying. Both
 		// refuse the upload — fail closed (R11) — but a store this service cannot
@@ -134,7 +150,7 @@ func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Calle
 		}
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	release := func() { h.svc.quota.Release(uploadID, req.GetGroup(), req.GetNamespace()) }
+	release := func() { h.svc.quota.Release(uploadID, req.GetGroup()) }
 
 	now := h.svc.now()
 	expiresMs := conf.uploadExpiry(now)
@@ -159,7 +175,7 @@ func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Calle
 		return nil, recordWriteStatus(err)
 	}
 
-	key := BlobKey{Group: req.GetGroup(), Namespace: req.GetNamespace(), Hash: req.GetContentHash()}
+	key := BlobKey{Group: req.GetGroup(), Hash: req.GetContentHash()}
 	existing, err := h.svc.records.FetchBlob(ctx, tenant, key.String())
 	if err != nil {
 		release()
@@ -182,11 +198,11 @@ func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Calle
 // CancelUpload releases the reservation and settles the session (R9 step 4).
 // IDEMPOTENT: a session that has already settled answers cancelled=false.
 func (h *Handler) CancelUpload(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.CancelUploadRequest) (*blobstore_pb.CancelUploadResponse, error) {
-	owner, err := callerPrincipal(caller)
+	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
 	}
-	tenant, err := requestTenant(req.GetNamespace())
+	tenant, err := h.requestTenant(req.GetTenant(), req.GetNamespace())
 	if err != nil {
 		return nil, err
 	}
@@ -203,8 +219,8 @@ func (h *Handler) CancelUpload(ctx context.Context, caller *servicemanager.Calle
 	if session.GetState() != blobstore_pb.UploadState_UPLOAD_STATE_PENDING {
 		return &blobstore_pb.CancelUploadResponse{Cancelled: false}, nil
 	}
-	h.svc.quota.Release(session.GetUploadId(), session.GetGroup(), session.GetNamespace())
-	if err := h.svc.settleSession(ctx, tenant, session, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
+	h.svc.quota.Release(session.GetUploadId(), session.GetGroup())
+	if err := h.svc.settleSession(ctx, session, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
 		if errors.Is(err, ErrRecordChanged) {
 			// Settled underneath this call — the upload finished, or the sweep or
 			// another cancel got there first. Either way it is no longer this
@@ -223,14 +239,14 @@ func (h *Handler) CancelUpload(ctx context.Context, caller *servicemanager.Calle
 // CreateLink mints a durable bearer link (R7). The raw token is returned once and
 // stored nowhere; the row holds sha256(token).
 func (h *Handler) CreateLink(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.CreateLinkRequest) (*blobstore_pb.CreateLinkResponse, error) {
-	owner, err := callerPrincipal(caller)
+	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
 	}
 	if err := ValidateFilename(req.GetFilename()); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	tenant, err := requestTenant(req.GetNamespace())
+	tenant, err := h.requestTenant(req.GetTenant(), req.GetNamespace())
 	if err != nil {
 		return nil, err
 	}
@@ -266,14 +282,14 @@ func (h *Handler) CreateLink(ctx context.Context, caller *servicemanager.Caller,
 // CreateBlobUrl mints a short-lived self-use link — the doc's GetBlobUrl. Same row
 // type as CreateLink; only expires_ms differs.
 func (h *Handler) CreateBlobUrl(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.CreateBlobUrlRequest) (*blobstore_pb.CreateBlobUrlResponse, error) {
-	owner, err := callerPrincipal(caller)
+	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
 	}
 	if err := ValidateFilename(req.GetFilename()); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	tenant, err := requestTenant(req.GetNamespace())
+	tenant, err := h.requestTenant(req.GetTenant(), req.GetNamespace())
 	if err != nil {
 		return nil, err
 	}
@@ -311,11 +327,11 @@ func (h *Handler) CreateBlobUrl(ctx context.Context, caller *servicemanager.Call
 // RevokeLink stops a link resolving immediately (R7). The row is KEPT with
 // revoked_ms set, for audit. IDEMPOTENT.
 func (h *Handler) RevokeLink(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.RevokeLinkRequest) (*blobstore_pb.RevokeLinkResponse, error) {
-	owner, err := callerPrincipal(caller)
+	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
 	}
-	tenant, err := requestTenant(req.GetNamespace())
+	tenant, err := h.requestTenant(req.GetTenant(), req.GetNamespace())
 	if err != nil {
 		return nil, err
 	}
@@ -356,11 +372,11 @@ func (h *Handler) RevokeLink(ctx context.Context, caller *servicemanager.Caller,
 // the cost is a sort of that set per page rather than a scan of the store.
 func (h *Handler) ListLinks(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.ListLinksRequest, page collection.PageParams) (collection.Page[*blobstore_pb.BlobLink], error) {
 	var empty collection.Page[*blobstore_pb.BlobLink]
-	owner, err := callerPrincipal(caller)
+	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return empty, err
 	}
-	tenant, err := requestTenant(req.GetNamespace())
+	tenant, err := h.requestTenant(req.GetTenant(), req.GetNamespace())
 	if err != nil {
 		return empty, err
 	}
@@ -411,11 +427,11 @@ func (h *Handler) ListLinks(ctx context.Context, caller *servicemanager.Caller, 
 // which is worse than a delete the owner has to retry. The record flag is written
 // last, so the row still points at bytes for as long as any bytes remain.
 func (h *Handler) DeleteBlob(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.DeleteBlobRequest) (*blobstore_pb.DeleteBlobResponse, error) {
-	owner, err := callerPrincipal(caller)
+	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
 	}
-	tenant, err := requestTenant(req.GetNamespace())
+	tenant, err := h.requestTenant(req.GetTenant(), req.GetNamespace())
 	if err != nil {
 		return nil, err
 	}
@@ -439,7 +455,7 @@ func (h *Handler) DeleteBlob(ctx context.Context, caller *servicemanager.Caller,
 	if err := h.svc.mirror.DeleteOnPeer(ctx, key); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	if err := h.svc.store.Remove(key.Group, key.Namespace, key.Hash); err != nil {
+	if err := h.svc.store.Remove(key.Group, key.Hash); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	next := cloneBlob(blob)
@@ -455,14 +471,14 @@ func (h *Handler) DeleteBlob(ctx context.Context, caller *servicemanager.Caller,
 // for up to a whole flush interval. It is still only this pod's view of the other
 // pod's contribution — see BlobLinkStats's own comment.
 func (h *Handler) GetLinkStats(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.GetLinkStatsRequest) (*blobstore_pb.BlobLinkStats, error) {
-	owner, err := callerPrincipal(caller)
+	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
 	}
 	// The LINK is what the caller owns; the stats row is derived from it. Checking
 	// the link means a stats row that has never been flushed still refuses a
 	// caller who does not own the link.
-	tenant, err := requestTenant(req.GetNamespace())
+	tenant, err := h.requestTenant(req.GetTenant(), req.GetNamespace())
 	if err != nil {
 		return nil, err
 	}
@@ -501,7 +517,7 @@ func (h *Handler) GetLinkStats(ctx context.Context, caller *servicemanager.Calle
 // the caller retries the whole call, which reads the row afresh. A replaced row
 // that is gone (purged) is NOT_FOUND. An insert of a key that exists cannot happen
 // to a key minted from 256 random bits, so it is INTERNAL, and so is a row written
-// outside the tenant the call names: every RPC routes by its own namespace.
+// outside the tenant the call names: every RPC's namespace is its tenant's.
 func recordWriteStatus(err error) error {
 	switch {
 	case errors.Is(err, ErrRecordOutsideTenant):

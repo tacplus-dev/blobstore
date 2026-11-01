@@ -21,24 +21,27 @@ const (
 // UploadPath and BlobPath are the paths the RPCs hand out: the tenant, then the
 // token, `/upload/<tid>/<token>` and `/b/<tid>/<token>`.
 //
-// THE TENANT IS IN THE PATH (#8). A token is raw randomness; the row it hashes to
-// is in its tenant's own Stratum, which has to be named before the row can be
-// read (tacplus-dev/roadmap decisions/tenant-routing-2026-10-26.md: the request
+// THE TENANT IS IN THE PATH. A token is raw randomness, and blobstore is
+// tenant-owned (#9): the gateway has to know which tenant's instance a path is
+// for before anything can read the row the token hashes to, and it sends the
+// path to the instance of the tid it names, by the same rule as an RPC's route
+// field (tacplus-dev/roadmap decisions/tenant-routing-2026-10-26.md: the request
 // names its tenant). The tid is not a secret and authorizes nothing: the token
-// is still the whole grant, and a token presented under another tid is a 404,
-// because that tenant's store holds no such row.
+// is still the whole grant. A token presented under another tid, or at another
+// tenant's instance, is a 404: that instance's store holds no such row.
 func UploadPath(tenant, token string) string { return PathUpload + tenant + "/" + token }
 func BlobPath(tenant, token string) string   { return PathBlob + tenant + "/" + token }
 
 // bearerPath splits what follows a byte path's prefix into its tenant and
-// token. Anything else (no tenant, a tenant that is not a tid, an empty token,
-// a further segment) is not a path this service hands out.
-func bearerPath(rest string) (tenant, token string, ok bool) {
-	tenant, token, _ = strings.Cut(rest, "/")
-	if !ValidTenantID(tenant) || token == "" || strings.Contains(token, "/") {
-		return "", "", false
+// token, and keeps only a path of this instance's tenant. Anything else (no
+// tenant, a tenant that is not a tid, another tenant, an empty token, a further
+// segment) is not a path this instance hands out, and reads no row.
+func (s *Service) bearerPath(rest string) (token string, ok bool) {
+	tenant, token, _ := strings.Cut(rest, "/")
+	if tenant != s.tenant || !ValidTenantID(tenant) || token == "" || strings.Contains(token, "/") {
+		return "", false
 	}
-	return tenant, token, true
+	return token, true
 }
 
 // BytesHandler is the public listener's router. It is deliberately a hand-written
@@ -78,13 +81,13 @@ func (s *Service) serveBlob(w http.ResponseWriter, r *http.Request, rest string)
 		http.Error(w, "", http.StatusMethodNotAllowed)
 		return
 	}
-	tenant, token, ok := bearerPath(rest)
+	token, ok := s.bearerPath(rest)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
 
-	link, err := s.records.FetchLink(r.Context(), tenant, LinkTokenHash(token))
+	link, err := s.records.FetchLink(r.Context(), s.tenant, LinkTokenHash(token))
 	if err != nil {
 		zap.L().Error("failed to read BlobLink", zap.Error(err))
 		http.Error(w, "", http.StatusServiceUnavailable)
@@ -97,7 +100,7 @@ func (s *Service) serveBlob(w http.ResponseWriter, r *http.Request, rest string)
 		return
 	}
 
-	blob, err := s.records.FetchBlob(r.Context(), tenant, link.GetBlobId())
+	blob, err := s.records.FetchBlob(r.Context(), s.tenant, link.GetBlobId())
 	if err != nil {
 		zap.L().Error("failed to read Blob", zap.Error(err))
 		http.Error(w, "", http.StatusServiceUnavailable)
@@ -115,7 +118,7 @@ func (s *Service) serveBlob(w http.ResponseWriter, r *http.Request, rest string)
 		http.Error(w, "", http.StatusInternalServerError)
 		return
 	}
-	f, info, err := s.store.Open(key.Group, key.Namespace, key.Hash)
+	f, info, err := s.store.Open(key.Group, key.Hash)
 	if err != nil {
 		// A record that points at bytes this pod does not hold. Anti-entropy is
 		// what closes this, and it runs at start-up — so this line means a gap
@@ -154,7 +157,7 @@ func (s *Service) serveBlob(w http.ResponseWriter, r *http.Request, rest string)
 
 	counted := &countingWriter{inner: w}
 	http.ServeContent(responseWriterWith(w, counted), r, link.GetFilename(), info.ModTime(), f)
-	s.stats.Record(tenant, link.GetTokenHash(), link.GetOwnerPrincipal(), link.GetNamespace(), counted.written)
+	s.stats.Record(link.GetTokenHash(), link.GetOwnerPrincipal(), link.GetNamespace(), counted.written)
 }
 
 // serveUpload receives the bytes for one upload, mirrors them to the peer, and
@@ -171,7 +174,7 @@ func (s *Service) serveUpload(w http.ResponseWriter, r *http.Request, rest strin
 		return
 	}
 
-	tenant, token, ok := bearerPath(rest)
+	token, ok := s.bearerPath(rest)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -180,7 +183,7 @@ func (s *Service) serveUpload(w http.ResponseWriter, r *http.Request, rest strin
 	// VERIFICATION IS A LOOKUP (R3, R9). The token is raw randomness; the row it
 	// hashes to, in the tenant's store, is the grant, and the row's fields are the
 	// upload's terms. There is no signature and no key.
-	session, err := s.records.FetchSession(r.Context(), tenant, UploadTokenHash(token))
+	session, err := s.records.FetchSession(r.Context(), s.tenant, UploadTokenHash(token))
 	if err != nil {
 		// A stratum this pod cannot read is information about US, not about the
 		// token — 503, same as serveBlob (R11).
@@ -208,7 +211,7 @@ func (s *Service) serveUpload(w http.ResponseWriter, r *http.Request, rest strin
 	// The row was written by this service and validated at CreateUpload. It is
 	// re-checked here anyway because what comes next builds a filesystem path out
 	// of it, and the cost of being wrong about that is a path traversal.
-	if err := validateBlobKey(session.GetGroup(), session.GetNamespace(), session.GetContentHash()); err != nil {
+	if err := validateBlobKey(session.GetGroup(), session.GetContentHash()); err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -242,19 +245,19 @@ func (s *Service) serveUpload(w http.ResponseWriter, r *http.Request, rest strin
 		return
 	}
 
-	blobID, status, err := s.receiveAndPromote(r, tenant, token, session, vg.GetMaxBlobBytes())
+	blobID, status, err := s.receiveAndPromote(r, token, session, vg.GetMaxBlobBytes())
 	if err != nil {
 		// The reservation goes back and the session settles ABORTED: a failed
 		// upload must not leave a tenant's quota spent (R9 step 3).
-		s.quota.Release(uploadID, session.GetGroup(), session.GetNamespace())
+		s.quota.Release(uploadID, session.GetGroup())
 		s.consumed.Delete(uploadID)
-		s.abortSession(r, tenant, session)
+		s.abortSession(r, session)
 		zap.L().Warn("upload failed", zap.String("upload_id", uploadID), zap.Error(err))
 		http.Error(w, err.Error(), status)
 		return
 	}
 
-	s.quota.Commit(uploadID, session.GetGroup(), session.GetNamespace())
+	s.quota.Commit(uploadID, session.GetGroup())
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	// A tiny hand-written JSON object rather than a marshalled struct: it has one
@@ -278,7 +281,7 @@ func (s *Service) serveUpload(w http.ResponseWriter, r *http.Request, rest strin
 // copy is a dedup rather than a conflict.
 func (s *Service) receiveAndPromote(
 	r *http.Request,
-	tenant, token string,
+	token string,
 	session *blobstore_pb.UploadSession,
 	maxBlobBytes int64,
 ) (blobID string, status int, err error) {
@@ -286,7 +289,7 @@ func (s *Service) receiveAndPromote(
 	if err != nil {
 		return "", http.StatusInternalServerError, fmt.Errorf("creating temp file: %w", err)
 	}
-	mirrorW, finishMirror, abortMirror, err := s.mirror.ForwardUpload(r.Context(), tenant, token)
+	mirrorW, finishMirror, abortMirror, err := s.mirror.ForwardUpload(r.Context(), s.tenant, token)
 	if err != nil {
 		s.store.DiscardTemp(tmp)
 		return "", http.StatusServiceUnavailable, fmt.Errorf("opening peer stream: %w", err)
@@ -326,12 +329,12 @@ func (s *Service) receiveAndPromote(
 		return "", http.StatusServiceUnavailable, err
 	}
 
-	if err := s.store.Promote(tmp, session.GetGroup(), session.GetNamespace(), session.GetContentHash()); err != nil {
+	if err := s.store.Promote(tmp, session.GetGroup(), session.GetContentHash()); err != nil {
 		return "", http.StatusInternalServerError, err
 	}
 	promoted = true
 
-	key := BlobKey{Group: session.GetGroup(), Namespace: session.GetNamespace(), Hash: session.GetContentHash()}
+	key := BlobKey{Group: session.GetGroup(), Hash: session.GetContentHash()}
 	nowMs := s.now().UnixMilli()
 	blob := &blobstore_pb.Blob{
 		BlobId:         key.String(),
@@ -343,7 +346,7 @@ func (s *Service) receiveAndPromote(
 		OwnerPrincipal: session.GetOwnerPrincipal(),
 		Namespace:      session.GetNamespace(),
 	}
-	if err := s.records.PutBlob(r.Context(), tenant, blob); err != nil {
+	if err := s.records.PutBlob(r.Context(), s.tenant, blob); err != nil {
 		// The bytes are on both pods and the record is not. Fail the upload: the
 		// caller must not believe it has a blob it cannot find. The bytes stay,
 		// and a retry of the same content promotes to the same path and writes
@@ -353,7 +356,7 @@ func (s *Service) receiveAndPromote(
 
 	// Re-read rather than settling the row this request started from: the sweep
 	// or a CancelUpload may have moved it while the bytes were in flight.
-	fresh, err := s.records.FetchSession(r.Context(), tenant, session.GetUploadId())
+	fresh, err := s.records.FetchSession(r.Context(), s.tenant, session.GetUploadId())
 	if err != nil || fresh == nil {
 		// The Blob row is written, which is what the caller needs. A session row
 		// that could not be settled is an audit-trail gap and the expiry sweep
@@ -362,7 +365,7 @@ func (s *Service) receiveAndPromote(
 			zap.String("upload_id", session.GetUploadId()), zap.Error(err))
 		return blob.GetBlobId(), http.StatusCreated, nil
 	}
-	if err := s.settleSession(r.Context(), tenant, fresh, blobstore_pb.UploadState_UPLOAD_STATE_COMMITTED); err != nil {
+	if err := s.settleSession(r.Context(), fresh, blobstore_pb.UploadState_UPLOAD_STATE_COMMITTED); err != nil {
 		zap.L().Warn("could not settle the committed upload session",
 			zap.String("upload_id", session.GetUploadId()), zap.Error(err))
 	}
@@ -372,15 +375,15 @@ func (s *Service) receiveAndPromote(
 // abortSession settles a failed upload's session, best effort: the reservation is
 // already released in memory, and the expiry sweep settles the row if this does
 // not.
-func (s *Service) abortSession(r *http.Request, tenant string, session *blobstore_pb.UploadSession) {
-	fresh, err := s.records.FetchSession(r.Context(), tenant, session.GetUploadId())
+func (s *Service) abortSession(r *http.Request, session *blobstore_pb.UploadSession) {
+	fresh, err := s.records.FetchSession(r.Context(), s.tenant, session.GetUploadId())
 	if err != nil || fresh == nil {
 		return
 	}
 	if fresh.GetState() != blobstore_pb.UploadState_UPLOAD_STATE_PENDING {
 		return
 	}
-	if err := s.settleSession(r.Context(), tenant, fresh, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
+	if err := s.settleSession(r.Context(), fresh, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
 		zap.L().Warn("could not settle the aborted upload session",
 			zap.String("upload_id", session.GetUploadId()), zap.Error(err))
 	}

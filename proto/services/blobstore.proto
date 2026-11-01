@@ -14,17 +14,24 @@
 // that holds the grant, so verification is a lookup and revocation is deleting
 // a row (R3, R7). There is no signing key anywhere in this service.
 //
-// THE TENANT IS IN THE PATH (#8). Stratum is tenant_owned: a row lives in its
-// tenant's own instance, and a call reaches the instance of the tenant it names
-// (tacplus-dev/roadmap decisions/tenant-routing-2026-10-26.md). A token is only
-// randomness, so the path names the tenant (`<tid>`, the 8-character id of the
-// namespace /tenants/<tid>) before it. The tid is not a secret and grants
-// nothing; a token presented under another tid is a 404. Rows are kept only in a
-// tenant's namespace: an RPC naming any other namespace is INVALID_ARGUMENT.
+// ONE INSTANCE PER TENANT (#9). blobstore is tenant_owned: each tenant has its
+// own instance in /tenants/<tid>, with its own two pods, its own PVCs holding
+// only that tenant's bytes (`<data_dir>/<group>/<sha256>`), and its own
+// Stratum for the rows, reached as a same-tenant call. Nothing in /system holds
+// or serves a tenant's blobs, and no instance calls into another tenant
+// (tacplus-dev/roadmap decisions/s2s-never-crosses-tenants-2026-10-31.md,
+// addendum 2026-11-01). Every rpc names its target tenant in `tenant`, its
+// route field, and the byte paths name it before the token (`<tid>`, the
+// 8-character id of the namespace /tenants/<tid>): the gateway sends both to
+// that tenant's instance. The tid is not a secret and grants nothing. An
+// instance refuses a request routed to another tenant, a row namespace other
+// than its own tenant's, and a caller from outside its tenant (/system
+// included); a token presented under another tid, or at another tenant's
+// instance, is a 404.
 //
 // WHAT THIS IS NOT. A filesystem. Every upload names a VOLUME GROUP declared at
 // build time by the consuming service, and the group is what bounds content
-// types, blob size and per-tenant quota (R4). No group, no upload.
+// types, blob size and the tenant's quota (R4). No group, no upload.
 //
 // WHY THERE IS NO RPC THAT CARRIES BYTES. A blob is up to `max_blob_bytes`, and
 // the fleet's unary ceiling is 10MB. The byte paths are HTTP for the same
@@ -40,7 +47,7 @@ import "sys/host.proto";
 
 // The service ID is assigned in registry.yaml, not here. IDs are GLOBAL across
 // every proto repo merged into a build and the merge hard-errors on collision.
-option (spec.service) = {name: "blobstore"};
+option (spec.service) = {name: "blobstore", tenant_owned: true};
 
 // STORED-ROW READS. Every one of this service's own record types is read back:
 // `/b/<tid>/<token>` resolves a BlobLink and then its Blob, `/upload/<tid>/<token>` needs
@@ -72,7 +79,7 @@ option (spec.record_read) = {record: "blobstore.BlobLinkStats"};
 // "no group, no upload" means. It is not a reason to invent a default group.
 message VolumeGroup {
   // name is the group's identity, and the first path segment of every file it
-  // holds (`<group>/<ns>/<sha256>`). Unique across the fleet — tacplus refuses
+  // holds (`<group>/<sha256>`). Unique across the fleet — tacplus refuses
   // a duplicate at generation, so this service does not have to arbitrate.
   string name = 1 [
     (spec.assert_required) = true,
@@ -99,9 +106,10 @@ message VolumeGroup {
     (spec.assert_element_max_size) = 128
   ];
 
-  // tenant_quota_bytes is the ceiling on the SUM of promoted blob sizes for one
-  // tenant in this group. Quotas hang off the group and there is no separate
-  // global tenant quota (R4).
+  // tenant_quota_bytes is the ceiling on the SUM of promoted blob sizes in this
+  // group on one tenant's instance: each instance holds one tenant's blobs, so
+  // the quota is per tenant and per group. Quotas hang off the group and there
+  // is no separate global tenant quota (R4).
   int64 tenant_quota_bytes = 4 [
     (spec.assert_required) = true,
     (spec.assert_gt) = 0
@@ -126,7 +134,8 @@ message Config {
   // and `GET|HEAD /b/<tid>/<t>`, and nothing else.
   //
   // IN-CLUSTER ONLY, exactly like letsencrypt's ACME responder: the gateway
-  // owns the edge and proxies these two prefixes here, so this listener needs
+  // owns the edge and proxies these two prefixes to the instance of the tenant
+  // whose tid the path names (#9), so this listener needs
   // no externally-exposed Service of its own. It is plaintext because the hop
   // is in-cluster and the token in the path is the whole authorization; the
   // gateway is what terminates TLS for the client.
@@ -139,8 +148,9 @@ message Config {
   // cluster can reach this port at all.
   host.Host peer_listener = 3 [(spec.default_host) = {host: "0.0.0.0", port: 8081}];
 
-  // peers is the `host:port` peer_listener address of EVERY replica, including
-  // this pod's own, from the StatefulSet's stable per-pod DNS
+  // peers is the `host:port` peer_listener address of EVERY replica of this
+  // tenant's instance, including this pod's own, from the StatefulSet's stable
+  // per-pod DNS in the tenant's namespace
   // (`blobstore-0.blobstore:8081,blobstore-1.blobstore:8081`). The pod finds
   // itself by matching its hostname against the first DNS label and treats the
   // rest as peers.
@@ -151,8 +161,10 @@ message Config {
   // only let the two disagree.
   repeated string peers = 4 [(spec.assert_max_size) = 8, (spec.assert_element_max_size) = 253];
 
-  // data_dir is the PVC mount holding `<group>/<ns>/<sha256>` and the `tmp`
-  // directory partial uploads are written into.
+  // data_dir is the PVC mount holding `<group>/<sha256>` and the `tmp`
+  // directory partial uploads are written into. The PVC is this tenant
+  // instance's own and holds only its tenant's bytes, so there is no namespace
+  // level (#9).
   //
   // The default is UNDER /app/data because that is where the operator's chart
   // mounts a service's volumeClaimTemplate (`- name: data / mountPath:
@@ -200,8 +212,9 @@ message Config {
 // BOTH pods. A Blob row never points at bytes that are not on both pods (R9).
 //
 // IMMUTABLE AND CONTENT-ADDRESSED, PER TENANT (R5). Identity is
-// `(group, namespace, content_hash)` and dedup is within a tenant and group
-// only: two tenants holding the same bytes hold two files and each pays. A
+// `(group, content_hash)` in one tenant's instance, and dedup is within a
+// tenant and group only: two tenants holding the same bytes hold two files, on
+// their own instances' disks, and each pays. A
 // global key would have been a cross-tenant content oracle — ask whether a hash
 // exists and learn that someone else has the document — and it contradicted
 // DocHashIndex's own per-namespace rule.
@@ -248,10 +261,10 @@ message Blob {
     residency: {idle_seconds: 604800 deleted_max_age_seconds: 2592000}
   };
 
-  // blob_id is the record key and the file's path: `<group>/<ns>/<sha256-hex>`.
-  // Carried as one string rather than derived on read because it IS the key,
-  // and a key a reader has to assemble from three fields is a key two callers
-  // can assemble differently.
+  // blob_id is the record key and the file's path: `<group>/<sha256-hex>`,
+  // unique in the tenant's own store. Carried as one string rather than derived
+  // on read because it IS the key, and a key a reader has to assemble from two
+  // fields is a key two callers can assemble differently.
   string blob_id = 1 [
     (spec.indexed) = true,
     (spec.assert_required) = true,
@@ -261,7 +274,7 @@ message Blob {
 
   // group is the volume group this blob belongs to — the group whose rules
   // admitted it. EQ-filterable because per-group quota accounting is a query
-  // over exactly this field plus `namespace`.
+  // over exactly this field.
   string group = 2 [
     (spec.assert_required) = true,
     (spec.assert_max_size) = 64,
@@ -326,9 +339,9 @@ message Blob {
     (spec.query_field) = {op: QUERY_OP_EQ}
   ];
 
-  // namespace is the OWNING TENANT (R6) and the second segment of blob_id. It
-  // is what makes dedup per-tenant: the same bytes under two namespaces are two
-  // rows and two files.
+  // namespace is the OWNING TENANT (R6): /tenants/<tid> of the instance that
+  // holds the row, and the store's tenant check on it. Dedup is per tenant
+  // because each tenant's rows and files are on its own instance.
   string namespace = 10 [
     (spec.store_namespace) = true,
     (spec.assert_required) = true,
@@ -440,7 +453,7 @@ message UploadSession {
   ];
 
   // owner_principal and namespace are the owning service and owning tenant, as
-  // on Blob. The reservation is against exactly this pair's group quota.
+  // on Blob. The reservation is against the tenant instance's group quota.
   string owner_principal = 10 [
     (spec.store_principal) = true,
     (spec.assert_required) = true,
@@ -646,6 +659,12 @@ message BlobLinkStats {
 // here at all — a person reaches a blob through the `/b/` path with a token
 // their service minted for them.
 //
+// THE CALLER IS OF THE SAME TENANT (#9). An instance answers only services of
+// its own tenant: a caller in /system, or in another tenant, is refused before
+// a row is read (PERMISSION_DENIED). The generated door would let a /system
+// caller in; target_namespace_field already refuses it any tenant's namespace,
+// and the handler refuses it whatever it names.
+//
 // VERB NAMES DIFFER FROM THE DECISION DOC'S SKETCH, which wrote BeginUpload,
 // AbortUpload and GetBlobUrl. The RPC verb registry is CLOSED
 // (tacplus/pkg/internal/common/verbs/registry.json) and is enforced on s2s
@@ -672,6 +691,7 @@ service BlobStore {
       principal: RPC_PRINCIPAL_SERVICE
       auth_services: ["*"]
       target_namespace_field: "namespace"
+      route_field: "tenant"
     };
   }
 
@@ -683,6 +703,7 @@ service BlobStore {
       principal: RPC_PRINCIPAL_SERVICE
       auth_services: ["*"]
       target_namespace_field: "namespace"
+      route_field: "tenant"
     };
   }
 
@@ -694,6 +715,7 @@ service BlobStore {
       principal: RPC_PRINCIPAL_SERVICE
       auth_services: ["*"]
       target_namespace_field: "namespace"
+      route_field: "tenant"
     };
   }
 
@@ -705,6 +727,7 @@ service BlobStore {
       principal: RPC_PRINCIPAL_SERVICE
       auth_services: ["*"]
       target_namespace_field: "namespace"
+      route_field: "tenant"
     };
   }
 
@@ -715,6 +738,7 @@ service BlobStore {
       principal: RPC_PRINCIPAL_SERVICE
       auth_services: ["*"]
       target_namespace_field: "namespace"
+      route_field: "tenant"
     };
   }
 
@@ -733,6 +757,7 @@ service BlobStore {
       principal: RPC_PRINCIPAL_SERVICE
       auth_services: ["*"]
       target_namespace_field: "namespace"
+      route_field: "tenant"
     };
     option (spec.method_collection) = {
       mode: COLLECTION_MODE_PAGE,
@@ -752,6 +777,7 @@ service BlobStore {
       principal: RPC_PRINCIPAL_SERVICE
       auth_services: ["*"]
       target_namespace_field: "namespace"
+      route_field: "tenant"
     };
   }
 
@@ -761,6 +787,7 @@ service BlobStore {
       principal: RPC_PRINCIPAL_SERVICE
       auth_services: ["*"]
       target_namespace_field: "namespace"
+      route_field: "tenant"
     };
   }
 }
@@ -797,12 +824,23 @@ message CreateUploadRequest {
     (spec.assert_max_size) = 128
   ];
 
-  // namespace is the owning tenant, and (spec.rpc).target_namespace_field: the
-  // generated authorizer holds the caller to its own namespace or below before
-  // the handler runs, so a service cannot reserve quota in another tenant.
+  // namespace is the owning tenant's namespace, /tenants/<tenant>, and
+  // (spec.rpc).target_namespace_field: the generated authorizer holds the caller
+  // to its own namespace or below before the handler runs, so a service cannot
+  // reserve quota in another tenant.
   string namespace = 5 [
     (spec.assert_required) = true,
     (spec.assert_max_size) = 256
+  ];
+
+  // tenant is the target tenant's tid, and (spec.rpc).route_field: it decides
+  // which tenant's instance receives the call, and that instance refuses a
+  // request routed to any other tenant. `namespace` must be that tenant's
+  // namespace, /tenants/<tenant>: an instance keeps rows in no other.
+  string tenant = 6 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 8,
+    (spec.assert_max_size) = 8
   ];
 }
 
@@ -811,8 +849,9 @@ message CreateUploadResponse {
   string upload_id = 1 [(spec.assert_max_size) = 128];
 
   // upload_token is the raw single-use token. The client PUTs to
-  // `/upload/<tid>/<upload_token>` through the gateway, tid being the tenant of
-  // the request's namespace. Returned once and stored nowhere.
+  // `/upload/<tid>/<upload_token>` through the gateway, tid being the request's
+  // tenant: the gateway sends it to that tenant's instance. Returned once and
+  // stored nowhere.
   string upload_token = 2 [(spec.assert_max_size) = 1024];
 
   // upload_path is `/upload/<tid>/<upload_token>` — the path to PUT to,
@@ -829,7 +868,7 @@ message CreateUploadResponse {
   // hash up front.
   bool already_present = 5;
 
-  // blob_id is the id the bytes will have, `<group>/<ns>/<sha256>`. Known
+  // blob_id is the id the bytes will have, `<group>/<sha256>`. Known
   // before the upload because the key is the content hash the caller declared.
   string blob_id = 6 [(spec.assert_max_size) = 512];
 }
@@ -842,6 +881,14 @@ message CancelUploadRequest {
   string namespace = 2 [
     (spec.assert_required) = true,
     (spec.assert_max_size) = 256
+  ];
+
+  // tenant is the target tenant's tid and the route field; see
+  // CreateUploadRequest.tenant.
+  string tenant = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 8,
+    (spec.assert_max_size) = 8
   ];
 }
 
@@ -869,6 +916,14 @@ message CreateLinkRequest {
     (spec.assert_required) = true,
     (spec.assert_max_size) = 256
   ];
+
+  // tenant is the target tenant's tid and the route field; see
+  // CreateUploadRequest.tenant.
+  string tenant = 4 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 8,
+    (spec.assert_max_size) = 8
+  ];
 }
 
 message CreateLinkResponse {
@@ -876,7 +931,7 @@ message CreateLinkResponse {
   string token = 1 [(spec.assert_max_size) = 1024];
 
   // link_path is `/b/<tid>/<token>`, the path the holder GETs: tid is the
-  // tenant of the request's namespace, and the token resolves only under it.
+  // request's tenant, and the token resolves only under it, at its instance.
   string link_path = 2 [(spec.assert_max_size) = 1024];
 
   // token_hash is the BlobLink key, and what RevokeLink names. Safe to keep:
@@ -910,6 +965,14 @@ message CreateBlobUrlRequest {
     (spec.assert_required) = true,
     (spec.assert_max_size) = 256
   ];
+
+  // tenant is the target tenant's tid and the route field; see
+  // CreateUploadRequest.tenant.
+  string tenant = 5 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 8,
+    (spec.assert_max_size) = 8
+  ];
 }
 
 message CreateBlobUrlResponse {
@@ -931,6 +994,14 @@ message RevokeLinkRequest {
   string namespace = 2 [
     (spec.assert_required) = true,
     (spec.assert_max_size) = 256
+  ];
+
+  // tenant is the target tenant's tid and the route field; see
+  // CreateUploadRequest.tenant.
+  string tenant = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 8,
+    (spec.assert_max_size) = 8
   ];
 }
 
@@ -956,6 +1027,14 @@ message ListLinksRequest {
   // declared order_by, so a page is stable under concurrent CreateLink.
   int32 page_size = 3 [(spec.assert_ge) = 0, (spec.assert_le) = 100];
   string page_token = 4 [(spec.assert_max_size) = 64];
+
+  // tenant is the target tenant's tid and the route field; see
+  // CreateUploadRequest.tenant.
+  string tenant = 5 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 8,
+    (spec.assert_max_size) = 8
+  ];
 }
 
 message ListLinksResponse {
@@ -981,6 +1060,14 @@ message DeleteBlobRequest {
     (spec.assert_required) = true,
     (spec.assert_max_size) = 256
   ];
+
+  // tenant is the target tenant's tid and the route field; see
+  // CreateUploadRequest.tenant.
+  string tenant = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 8,
+    (spec.assert_max_size) = 8
+  ];
 }
 
 message DeleteBlobResponse {
@@ -997,5 +1084,13 @@ message GetLinkStatsRequest {
   string namespace = 2 [
     (spec.assert_required) = true,
     (spec.assert_max_size) = 256
+  ];
+
+  // tenant is the target tenant's tid and the route field; see
+  // CreateUploadRequest.tenant.
+  string tenant = 3 [
+    (spec.assert_required) = true,
+    (spec.assert_min_size) = 8,
+    (spec.assert_max_size) = 8
   ];
 }
