@@ -138,6 +138,7 @@ func (s *Service) conf() *runtimeConfig { return s.cfg.Load() }
 // logged loudly and this pod serves the blobs it has; a read for a blob it lacks
 // is a 404 either way.
 func (s *Service) SyncOnStart(ctx context.Context) {
+	// trace: unrelated: the anti-entropy pass runs at start-up, before any request.
 	copied, err := s.mirror.SyncFromPeer(ctx, s.store)
 	if err != nil {
 		zap.L().Warn("anti-entropy could not reach the peer; serving the blobs this pod holds",
@@ -169,9 +170,11 @@ func (s *Service) RunBackground(ctx context.Context) {
 		case <-ctx.Done():
 			// One last flush on the way out, so a graceful shutdown does not throw
 			// away a whole interval's counters.
+			// trace: unrelated: the flush batches counters across requests.
 			s.stats.Flush(context.WithoutCancel(ctx))
 			return
 		case <-statsTick.C:
+			// trace: unrelated: the flush batches counters across requests.
 			s.stats.Flush(ctx)
 		case <-sweepTick.C:
 			s.sweepSessions(ctx)
@@ -190,6 +193,7 @@ func (s *Service) sweepSessions(ctx context.Context) {
 	if err := s.store.SweepTemps(); err != nil {
 		zap.L().Warn("failed to sweep temp files", zap.Error(err))
 	}
+	// trace: unrelated: the sweep runs on a timer, not for a request.
 	sessions, err := s.records.ListExpiredSessions(ctx, s.tenant, s.now().UnixMilli())
 	if err != nil {
 		zap.L().Warn("failed to list expired upload sessions", zap.Error(err))
@@ -200,6 +204,7 @@ func (s *Service) sweepSessions(ctx context.Context) {
 			continue
 		}
 		s.quota.Release(sess.GetUploadId(), sess.GetGroup())
+		// trace: unrelated: the sweep runs on a timer, not for a request.
 		if err := s.settleSession(ctx, sess, blobstore_pb.UploadState_UPLOAD_STATE_ABORTED); err != nil {
 			if errors.Is(err, ErrRecordChanged) {
 				// Settled since the list was read: an upload finished or was

@@ -99,6 +99,7 @@ func (s *Stats) Flush(ctx context.Context) {
 }
 
 func (s *Stats) flushOne(ctx context.Context, tokenHash string, delta *statsEntry) error {
+	// trace: unrelated: a delta sums the resolutions of many requests.
 	current, err := s.records.FetchLinkStats(ctx, s.tenant, tokenHash)
 	if err != nil {
 		return err
@@ -119,6 +120,8 @@ func (s *Stats) flushOne(ctx context.Context, tokenHash string, delta *statsEntr
 	// Conditional on the row read above: if the other pod flushed in between,
 	// the write is refused (ErrRecordExists, ErrRecordChanged) and the delta is
 	// kept for the next tick, which reads the other pod's flush and adds to it.
+	//
+	// trace: unrelated: a delta sums the resolutions of many requests.
 	if current == nil {
 		return s.records.InsertLinkStats(ctx, s.tenant, row)
 	}

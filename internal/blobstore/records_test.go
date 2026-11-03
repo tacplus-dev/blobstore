@@ -3,8 +3,10 @@ package blobstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"iter"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +47,15 @@ type fakeStratum struct {
 	watchers map[string][]chan fakeChange // "<tenant>|<record type>"
 	routed   []string
 
+	// calls is every request the store received, in order: its method and the
+	// trace_id it carried, so a test can see that a handler's trace reached
+	// each call it caused.
+	calls []fakeCall
+
+	// queries is the standing queries: their rows, matched when opened.
+	queries map[string][]proto.Message
+	queryN  int
+
 	// redoDown is the redo service unreachable: stratum refuses every write
 	// with UNAVAILABLE and still serves reads from memory.
 	redoDown bool
@@ -64,8 +75,190 @@ const (
 	fakeReplaceIfUnchanged
 )
 
+// fakeCall is one request the store received.
+type fakeCall struct {
+	method string // the RPC's name, without its service
+	trace  string
+}
+
 func newFakeStratum() *fakeStratum {
-	return &fakeStratum{rows: map[string]proto.Message{}, watchers: map[string][]chan fakeChange{}}
+	return &fakeStratum{
+		rows:     map[string]proto.Message{},
+		watchers: map[string][]chan fakeChange{},
+		queries:  map[string][]proto.Message{},
+	}
+}
+
+// saw records a request: every request type of the plane carries trace_id.
+func (f *fakeStratum) saw(fullMethod string, req any) {
+	tr, _ := req.(interface{ GetTraceId() string })
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := fakeCall{method: fullMethod[strings.LastIndexByte(fullMethod, '/')+1:]}
+	if tr != nil {
+		call.trace = tr.GetTraceId()
+	}
+	f.calls = append(f.calls, call)
+}
+
+// takeCalls returns the requests received so far and forgets them.
+func (f *fakeStratum) takeCalls() []fakeCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	calls := f.calls
+	f.calls = nil
+	return calls
+}
+
+// seed stores a row as if an earlier write had, without a call.
+func (f *fakeStratum) seed(tenant, typ, key string, row proto.Message) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revision++
+	f.rows[tenant+"|"+typ+"/"+key] = proto.Clone(row)
+}
+
+// tracedStream records a streaming call's request as the handler reads it.
+type tracedStream struct {
+	grpc.ServerStream
+	fake   *fakeStratum
+	method string
+}
+
+func (s *tracedStream) RecvMsg(m any) error {
+	if err := s.ServerStream.RecvMsg(m); err != nil {
+		return err
+	}
+	s.fake.saw(s.method, m)
+	return nil
+}
+
+// openQuery opens a standing query over the rows of typ in tenant that keep
+// matches.
+func (f *fakeStratum) openQuery(tenant, typ string, keep func(proto.Message) bool) *query_pb.QueryHandle {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.routed = append(f.routed, tenant)
+	var rows []proto.Message
+	for id, row := range f.rows {
+		if strings.HasPrefix(id, tenant+"|"+typ+"/") && keep(row) {
+			rows = append(rows, proto.Clone(row))
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return keyOf(rows[i]) < keyOf(rows[j]) })
+	f.queryN++
+	id := fmt.Sprintf("q%d", f.queryN)
+	f.queries[id] = rows
+	return &query_pb.QueryHandle{QueryId: id, TargetTenant: tenant}
+}
+
+// pullQuery answers ONE ROW A PAGE, so a list of n rows is n pages and the
+// caller's paging is exercised. The page token is the next row's index.
+func (f *fakeStratum) pullQuery(queryID, token string) (proto.Message, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rows, ok := f.queries[queryID]
+	if !ok {
+		return nil, "", status.Errorf(codes.NotFound, "no query %s", queryID)
+	}
+	i := 0
+	if token != "" {
+		if _, err := fmt.Sscan(token, &i); err != nil {
+			return nil, "", status.Errorf(codes.InvalidArgument, "page token %q", token)
+		}
+	}
+	if i >= len(rows) {
+		return nil, "", nil
+	}
+	next := ""
+	if i+1 < len(rows) {
+		next = fmt.Sprint(i + 1)
+	}
+	return rows[i], next, nil
+}
+
+func (f *fakeStratum) closeQuery(queryID string) (*query_pb.QueryStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rows, ok := f.queries[queryID]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "no query %s", queryID)
+	}
+	delete(f.queries, queryID)
+	return &query_pb.QueryStats{QueryId: queryID, Size: int64(len(rows))}, nil
+}
+
+func (f *fakeStratum) CreateBlobQuery(_ context.Context, req *query_pb.OpenBlobQueryRequest) (*query_pb.QueryHandle, error) {
+	filter := req.GetFilter()
+	return f.openQuery(req.GetTargetTenant(), "blobstore.Blob", func(m proto.Message) bool {
+		return filter.Group == nil || m.(*blobstore_pb.Blob).GetGroup() == filter.GetGroup()
+	}), nil
+}
+
+func (f *fakeStratum) ListBlob(_ context.Context, req *query_pb.PullBlobRequest) (*query_pb.PullBlobResponse, error) {
+	row, next, err := f.pullQuery(req.GetQueryId(), req.GetPageToken())
+	if err != nil {
+		return nil, err
+	}
+	resp := &query_pb.PullBlobResponse{NextPageToken: next}
+	if row != nil {
+		resp.Items = []*blobstore_pb.Blob{row.(*blobstore_pb.Blob)}
+	}
+	return resp, nil
+}
+
+func (f *fakeStratum) DeleteBlobQuery(_ context.Context, req *query_pb.QueryHandle) (*query_pb.QueryStats, error) {
+	return f.closeQuery(req.GetQueryId())
+}
+
+func (f *fakeStratum) CreateBlobLinkQuery(_ context.Context, req *query_pb.OpenBlobLinkQueryRequest) (*query_pb.QueryHandle, error) {
+	filter := req.GetFilter()
+	return f.openQuery(req.GetTargetTenant(), "blobstore.BlobLink", func(m proto.Message) bool {
+		l := m.(*blobstore_pb.BlobLink)
+		return (filter.BlobId == nil || l.GetBlobId() == filter.GetBlobId()) &&
+			(filter.Namespace == nil || l.GetNamespace() == filter.GetNamespace())
+	}), nil
+}
+
+func (f *fakeStratum) ListBlobLink(_ context.Context, req *query_pb.PullBlobLinkRequest) (*query_pb.PullBlobLinkResponse, error) {
+	row, next, err := f.pullQuery(req.GetQueryId(), req.GetPageToken())
+	if err != nil {
+		return nil, err
+	}
+	resp := &query_pb.PullBlobLinkResponse{NextPageToken: next}
+	if row != nil {
+		resp.Items = []*blobstore_pb.BlobLink{row.(*blobstore_pb.BlobLink)}
+	}
+	return resp, nil
+}
+
+func (f *fakeStratum) CreateUploadSessionQuery(_ context.Context, req *query_pb.OpenUploadSessionQueryRequest) (*query_pb.QueryHandle, error) {
+	filter := req.GetFilter()
+	return f.openQuery(req.GetTargetTenant(), "blobstore.UploadSession", func(m proto.Message) bool {
+		exp := m.(*blobstore_pb.UploadSession).GetExpiresMs()
+		return (filter.ExpiresMsFrom == nil || exp >= filter.GetExpiresMsFrom()) &&
+			(filter.ExpiresMsTo == nil || exp <= filter.GetExpiresMsTo())
+	}), nil
+}
+
+func (f *fakeStratum) ListUploadSession(_ context.Context, req *query_pb.PullUploadSessionRequest) (*query_pb.PullUploadSessionResponse, error) {
+	row, next, err := f.pullQuery(req.GetQueryId(), req.GetPageToken())
+	if err != nil {
+		return nil, err
+	}
+	resp := &query_pb.PullUploadSessionResponse{NextPageToken: next}
+	if row != nil {
+		resp.Items = []*blobstore_pb.UploadSession{row.(*blobstore_pb.UploadSession)}
+	}
+	return resp, nil
+}
+
+func (f *fakeStratum) DeleteUploadSessionQuery(_ context.Context, req *query_pb.QueryHandle) (*query_pb.QueryStats, error) {
+	return f.closeQuery(req.GetQueryId())
+}
+
+func (f *fakeStratum) DeleteBlobLinkQuery(_ context.Context, req *query_pb.QueryHandle) (*query_pb.QueryStats, error) {
+	return f.closeQuery(req.GetQueryId())
 }
 
 func (f *fakeStratum) get(tenant, typ, key string) (proto.Message, int64, error) {
@@ -321,7 +514,15 @@ func newStratumRecords(t *testing.T) (*recordStore, *fakeStratum) {
 	t.Helper()
 	fake := newFakeStratum()
 	lis := bufconn.Listen(1 << 20)
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(
+		grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			fake.saw(info.FullMethod, req)
+			return handler(ctx, req)
+		}),
+		grpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			return handler(srv, &tracedStream{ServerStream: ss, fake: fake, method: info.FullMethod})
+		}),
+	)
 	query_pb.RegisterRecordMapServer(srv, fake)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)

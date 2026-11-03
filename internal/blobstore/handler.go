@@ -30,6 +30,8 @@ type Handler struct {
 	svc *Service
 }
 
+// EVERY HANDLER FIRST PUTS ITS REQUEST'S trace_id IN ITS CONTEXT (withTrace), so
+// every record-plane call the request causes carries it (tacplus-dev/looper#51).
 func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
 
 // Service is the service this handler drives, for main.go's listener wiring.
@@ -107,6 +109,7 @@ func (h *Handler) requestTenant(tenant, namespace string) (string, error) {
 // CreateUpload is the doc's BeginUpload (R9 step 1), renamed for the closed verb
 // registry — see the service comment in blobstore.proto.
 func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.CreateUploadRequest) (*blobstore_pb.CreateUploadResponse, error) {
+	ctx = withTrace(ctx, req.GetTraceId())
 	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
@@ -198,6 +201,7 @@ func (h *Handler) CreateUpload(ctx context.Context, caller *servicemanager.Calle
 // CancelUpload releases the reservation and settles the session (R9 step 4).
 // IDEMPOTENT: a session that has already settled answers cancelled=false.
 func (h *Handler) CancelUpload(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.CancelUploadRequest) (*blobstore_pb.CancelUploadResponse, error) {
+	ctx = withTrace(ctx, req.GetTraceId())
 	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
@@ -239,6 +243,7 @@ func (h *Handler) CancelUpload(ctx context.Context, caller *servicemanager.Calle
 // CreateLink mints a durable bearer link (R7). The raw token is returned once and
 // stored nowhere; the row holds sha256(token).
 func (h *Handler) CreateLink(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.CreateLinkRequest) (*blobstore_pb.CreateLinkResponse, error) {
+	ctx = withTrace(ctx, req.GetTraceId())
 	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
@@ -282,6 +287,7 @@ func (h *Handler) CreateLink(ctx context.Context, caller *servicemanager.Caller,
 // CreateBlobUrl mints a short-lived self-use link — the doc's GetBlobUrl. Same row
 // type as CreateLink; only expires_ms differs.
 func (h *Handler) CreateBlobUrl(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.CreateBlobUrlRequest) (*blobstore_pb.CreateBlobUrlResponse, error) {
+	ctx = withTrace(ctx, req.GetTraceId())
 	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
@@ -327,6 +333,7 @@ func (h *Handler) CreateBlobUrl(ctx context.Context, caller *servicemanager.Call
 // RevokeLink stops a link resolving immediately (R7). The row is KEPT with
 // revoked_ms set, for audit. IDEMPOTENT.
 func (h *Handler) RevokeLink(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.RevokeLinkRequest) (*blobstore_pb.RevokeLinkResponse, error) {
+	ctx = withTrace(ctx, req.GetTraceId())
 	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
@@ -371,6 +378,7 @@ func (h *Handler) RevokeLink(ctx context.Context, caller *servicemanager.Caller,
 // by ListLinksForBlob. That read is bounded by the number of links one blob has, so
 // the cost is a sort of that set per page rather than a scan of the store.
 func (h *Handler) ListLinks(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.ListLinksRequest, page collection.PageParams) (collection.Page[*blobstore_pb.BlobLink], error) {
+	ctx = withTrace(ctx, req.GetTraceId())
 	var empty collection.Page[*blobstore_pb.BlobLink]
 	owner, err := h.callerPrincipal(caller)
 	if err != nil {
@@ -427,6 +435,7 @@ func (h *Handler) ListLinks(ctx context.Context, caller *servicemanager.Caller, 
 // which is worse than a delete the owner has to retry. The record flag is written
 // last, so the row still points at bytes for as long as any bytes remain.
 func (h *Handler) DeleteBlob(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.DeleteBlobRequest) (*blobstore_pb.DeleteBlobResponse, error) {
+	ctx = withTrace(ctx, req.GetTraceId())
 	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
@@ -471,6 +480,7 @@ func (h *Handler) DeleteBlob(ctx context.Context, caller *servicemanager.Caller,
 // for up to a whole flush interval. It is still only this pod's view of the other
 // pod's contribution — see BlobLinkStats's own comment.
 func (h *Handler) GetLinkStats(ctx context.Context, caller *servicemanager.Caller, req *blobstore_pb.GetLinkStatsRequest) (*blobstore_pb.BlobLinkStats, error) {
+	ctx = withTrace(ctx, req.GetTraceId())
 	owner, err := h.callerPrincipal(caller)
 	if err != nil {
 		return nil, err
@@ -617,6 +627,7 @@ var errConfigStateNotHosted = status.Error(codes.Unimplemented,
 // Shutdown drains what the service holds: the last stats flush is what matters,
 // because those counters live only in memory.
 func (h *Handler) Shutdown(ctx context.Context) {
+	// trace: unrelated: the flush batches counters across requests.
 	h.svc.stats.Flush(ctx)
 	zap.L().Info("blobstore shut down")
 }
