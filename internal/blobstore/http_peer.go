@@ -78,13 +78,16 @@ func (s *Service) servePeerBlob(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		http.ServeContent(w, r, key.Hash, info.ModTime(), f)
 	case http.MethodDelete:
+		// The other pod's DeleteBlob caused this, and its trace comes with it.
+		trace := zap.String("trace_id", r.Header.Get(PeerHeaderTrace))
 		// Idempotent: Store.Remove treats a missing file as done, because
 		// DeleteBlob may be retried and the peer may already have unlinked it.
 		if err := s.store.Remove(key.Group, key.Hash); err != nil {
-			zap.L().Error("failed to remove a blob for the peer", zap.Error(err))
+			zap.L().Error("failed to remove a blob for the peer", zap.String("blob_id", key.String()), trace, zap.Error(err))
 			http.Error(w, "", http.StatusInternalServerError)
 			return
 		}
+		zap.L().Debug("removed a blob for the peer", zap.String("blob_id", key.String()), trace)
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.Header().Set("Allow", "GET, DELETE")

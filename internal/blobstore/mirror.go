@@ -24,6 +24,12 @@ const (
 	PeerPathHealth = "/peer/healthz"
 )
 
+// PeerHeaderTrace carries, on a peer request an RPC causes, that RPC's
+// trace_id (tacplus-dev/looper#51). The peer paths are plain HTTP between the
+// two pods, with no message to put field 200 on, so the header is where it
+// goes; the peer's handler reads it back into its context and its logs.
+const PeerHeaderTrace = "X-Trace-Id"
+
 // peerHealthTimeout bounds the pre-flight check a PUT makes before it reads a
 // byte of the client's body.
 //
@@ -185,6 +191,9 @@ func (m *Mirror) DeleteOnPeer(ctx context.Context, k BlobKey) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, m.url(PeerPathBlob+k.String()), nil)
 	if err != nil {
 		return err
+	}
+	if id := traceOf(ctx); id != "" {
+		req.Header.Set(PeerHeaderTrace, id)
 	}
 	resp, err := m.client.Do(req)
 	if err != nil {

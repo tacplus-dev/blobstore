@@ -2,13 +2,18 @@ package blobstore
 
 import (
 	"context"
+	"net/http"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/tacplus-dev/blobstore/tacplus/chassis/collection"
 	"github.com/tacplus-dev/blobstore/tacplus/chassis/servicemanager"
 	wrapperToken "github.com/tacplus-dev/blobstore/tacplus/chassis/token"
 	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -360,6 +365,44 @@ func TestDeleteBlobRemovesTheBytesFromBothPods(t *testing.T) {
 	}
 	if again.GetDeleted() {
 		t.Error("a second delete reported deleted=true; it must be a no-op")
+	}
+}
+
+// The peer DELETE is caused by the RPC, so it carries the RPC's trace_id
+// (tacplus-dev/looper#51) in PeerHeaderTrace, and the peer's handler reads it:
+// its log of the unlink names the trace.
+func TestDeleteBlobCarriesItsTraceToThePeer(t *testing.T) {
+	logs, observed := observer.New(zap.DebugLevel)
+	defer zap.ReplaceGlobals(zap.New(logs))()
+
+	p := newPair(t)
+	h := NewHandler(p.a)
+	sess := p.uploadOne(t)
+
+	var mu sync.Mutex
+	var sent []string
+	p.bPeerRoute.set(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			mu.Lock()
+			sent = append(sent, r.Header.Get(PeerHeaderTrace))
+			mu.Unlock()
+		}
+		p.b.PeerHandler().ServeHTTP(w, r)
+	}))
+
+	if _, err := h.DeleteBlob(context.Background(), callerFor("docmanager"), &blobstore_pb.DeleteBlobRequest{
+		BlobId: blobIDOf(sess), Namespace: sess.GetNamespace(), Tenant: testTenant, TraceId: testTrace,
+	}); err != nil {
+		t.Fatalf("DeleteBlob: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(sent, []string{testTrace}) {
+		t.Fatalf("peer DELETEs carried %s %q; want one carrying %q", PeerHeaderTrace, sent, testTrace)
+	}
+	read := observed.FilterMessage("removed a blob for the peer").FilterField(zap.String("trace_id", testTrace))
+	if read.Len() != 1 {
+		t.Errorf("the peer logged %d unlinks under trace_id %q; want 1 (logs: %v)", read.Len(), testTrace, observed.All())
 	}
 }
 
