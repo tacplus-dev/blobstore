@@ -1,6 +1,7 @@
 language: go
-# compiler floor: the looper runs the latest 2.5.x image (stratum, a dependency, needs 2.5: #7).
-tacplus: "2.5"
+# compiler floor: the latest released line (#7, #13); tacplus.lock pins the exact 2.6.x release and
+# build image the builds run (tacplus pin, then commit it).
+tacplus: "2.6"
 # pkg is derived from go.mod (github.com/tacplus-dev/blobstore: the org name has a hyphen,
 # which pkg cannot carry). A derived Go package is <module>/tacplus, so the output is "tacplus".
 output-dir: tacplus
