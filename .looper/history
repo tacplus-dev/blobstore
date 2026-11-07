@@ -1,0 +1,1 @@
+- 2026-11-07 looper issue tacplus floor 2.5 is behind the latest released line (2.6): move the floor to 2.6 and commit tacplus.lock (#13)
