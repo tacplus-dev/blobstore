@@ -12,3 +12,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-01 looper issue Peers in Config, not env (uni-config, operator#17) (#10, 2adcee7)
 - 2026-11-03 looper issue Trace propagation: the RPC handlers drop the inbound trace_id on every Stratum record-plane call, and no test asserts it (#11, 1dab170)
 - 2026-11-03 looper issue Trace propagation: DeleteBlob drops its trace_id on the peer DELETE (/peer/blob/…), which has no trace convention (#12, f63199c)
+- 2026-11-07 looper issue tacplus floor 2.5 is behind the latest released line (2.6): move the floor to 2.6 and commit tacplus.lock (#13)
