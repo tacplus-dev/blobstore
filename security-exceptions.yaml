@@ -1,0 +1,8 @@
+# The security findings blobstore accepts, read by the build's security checks
+# (looper-scan, tacplus-dev/looper#49). Each entry needs an id, a reason, who
+# decided and when it expires; an expired one fails the checks again.
+exceptions:
+  - id: G703
+    reason: "gosec taint false positive: blobstore's temp paths come from os.CreateTemp in <data_dir>/tmp and blob paths are validated (#15)"
+    decided_by: "hub (Jody's delegation, 2026-11-07)"
+    expires: 2027-02-07
