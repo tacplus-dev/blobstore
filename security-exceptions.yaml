@@ -6,3 +6,7 @@ exceptions:
     reason: "gosec taint false positive: blobstore's temp paths come from os.CreateTemp in <data_dir>/tmp and blob paths are validated (#15)"
     decided_by: "hub (Jody's delegation, 2026-11-07)"
     expires: 2027-02-07
+  - id: G704
+    reason: "gosec taint false positive: the peer forward's host is Config.peers, its path the instance's tid and a validated token (#16)"
+    decided_by: "hub (Jody's delegation, 2026-11-07)"
+    expires: 2027-02-07
