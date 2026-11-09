@@ -14,3 +14,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-03 looper issue Trace propagation: DeleteBlob drops its trace_id on the peer DELETE (/peer/blob/…), which has no trace convention (#12, f63199c)
 - 2026-11-07 looper issue tacplus floor 2.5 is behind the latest released line (2.6): move the floor to 2.6 and commit tacplus.lock (#13)
 - 2026-11-08 looper issue Security exception needed: gosec G703 (path traversal) false positives in store.go fail the build's security checks (#15, b4b0c58)
+- 2026-11-09 looper issue Security exception needed: gosec G704 (SSRF) false positives in mirror.go's peer forward fail the build's security checks (#16)
