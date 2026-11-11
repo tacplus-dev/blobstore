@@ -1,0 +1,70 @@
+= init
+> Bash git status --short && git diff && git log --oneline -3 && gh issue view 19 --repo tacplus-dev/blobstore --comments | tail -30
+<  M STATE.md  M tacplus.lock diff --git a/STATE.md b/STATE.md index e5ba3e6..6dbf041 100644 --- a/STATE.md +++ b/STATE.md @@ -1,9 +1,9 @@  # State: blobstore   -Overwritten to stay current (loopers and agents). Last updated: 2026-11-08 by looper (#16). +Overwritten to stay current (loopers and agents...
+= thinking_tokens
+= thinking_tokens
+> Bash for p in 3053721343 3054110148; do curl -s "https://gitlab.com/api/v4/projects/tacplus-dev%2Fbuild/pipelines/$p" | head -c 600; echo; curl -s "https://gitlab.com/api/v4/projects/tacplus-dev%2Fbuild/pipelines/$p/jobs" | python3 -I -c 'import json,sys for j in json.load(sys.stdin): print(j["id"],j["na...
+< {"message":"404 Project Not Found"} Traceback (most recent call last):   File "<string>", line 2, in <module>     for j in json.load(sys.stdin): print(j["id"],j["name"],j["status"],j.get("started_at"),j.get("finished_at"),j.get("failure_reason"))                                          ~^^^^^^ Type...
+> Bash for p in 3053721343 3054110148; do glab api "projects/tacplus-dev%2Fbuild/pipelines/$p" 2>&1 | head -c 500; echo; glab api "projects/tacplus-dev%2Fbuild/pipelines/$p/jobs" 2>&1 | python3 -I -c 'import json,sys d=json.load(sys.stdin) for j in d: print(j["id"],j["name"],j["status"],j.get("started_at")...
+< Exit code 1 {"message":"404 Project Not Found"}glab: 404 Project Not Found (HTTP 404)  Traceback (most recent call last):   File "<string>", line 2, in <module>     d=json.load(sys.stdin)   File "/usr/lib/python3.13/json/__init__.py", line 293, in load     return loads(fp.read(),         cls=cls, ob...
+= thinking_tokens
+= thinking_tokens
+> Bash /usr/local/bin/repo-looper --help 2>&1 | head -40; gh issue list --repo tacplus-dev/looper --state open --search "verdict within" --limit 10; gh issue list --repo tacplus-dev/build --state open --limit 10 2>&1
+< Exit code 1 repo-looper: the looper of one tacplus-dev repository. It runs in the looper container, as jobs of the GitLab looper pipeline, and only while the repository has work: a job per issue, its report, and a manager per repository, which alone merges to its main (looper#70).    repo-looper --r...
+= thinking_tokens
+= thinking_tokens
+> Bash for n in 113 127; do gh issue view $n --repo tacplus-dev/looper --comments | tail -25; echo ======; done
+< The looper of looper starts this issue with its limit 4h capped at 4h by this job (https://gitlab.com/tacplus-dev/looper/-/jobs/17931029138), which ends sooner: the run stops by itself before then, its work checkpointed, and the next run resumes it. -- author:	tacplus-looper association:	none edited...
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+Builds have been starved for runners since this morning; checking the blocking cluster issue before deciding how to proceed.
+> Bash gh issue view 18 --repo tacplus-dev/cluster --json state,title,updatedAt,labels --jq '.state,.title,.updatedAt,[.labels[].name]'; gh issue view 18 --repo tacplus-dev/cluster --comments | tail -12
+< OPEN Hub: register and apply the in-cluster runners and cluster's own pipeline (README, What the hub does 1–7) 2026-11-10T10:40:27Z ["bug","approved","needs-decision","priority:high"] association:	none edited:	false status:	none -- The manager merged [`looper/cluster-18`](https://github.com/tacplus-...
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+> Bash git add STATE.md tacplus.lock && git commit -q -F - <<'EOF' Re-pin tacplus to 2.6.8: its build image's go1.27.4 fixes GO-2026-6859  The pinned build image (tacplus 2.6.1) compiles the release binary with go1.27.3, affected by GO-2026-6859 / CVE-2026-97054 (net/http HTTP/1 server crash on a MaxBytesR...
+< 32297cb Re-pin tacplus to 2.6.8: its build image's go1.27.4 fixes GO-2026-6859 5eef67e HISTORY.md: releases (looper) [2026-11-11T14:52:23Z] checkpoint of #19 (a step) pushed to looper/blobstore-19:  4 files changed, 229 insertions(+), 5 deletions(-)
+> Bash nohup /usr/local/bin/repo-looper --repo blobstore --issue 19 --land > /tmp/land-19.log 2>&1 & echo $! > /tmp/land-19.pid; cat /tmp/land-19.pid
+< 969
+> Bash timeout 90 bash -c 'until grep -qiE "queued|waiting|verdict" /tmp/land-19.log; do sleep 5; done'; cat /tmp/land-19.log
+= task_started
+= task_notification
+< [2026-11-11T14:52:27Z] checkpoint of #19 (land queued) pushed to looper/blobstore-19:  5 files changed, 236 insertions(+), 5 deletions(-) [2026-11-11T14:52:29Z] queued: the manager of blobstore merges looper/blobstore-19 after the lands queued before it, one at a time, and says on the issue what cam...
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+> Bash gh issue comment 19 --repo tacplus-dev/blobstore --body-file - <<'EOF' Status at 14:53Z, 2026-11-11. This run ends. The land stays queued, and the issue now waits on tacplus-dev/cluster#18.  - **Committed:** 32297cb on `looper/blobstore-19`, rebased on main 5eef67e. `tacplus.lock` now pins `tacplus:...
+< https://github.com/tacplus-dev/blobstore/issues/19#issuecomment-6799078158 [2026-11-11T14:52:27Z] checkpoint of #19 (land queued) pushed to looper/blobstore-19:  5 files changed, 236 insertions(+), 5 deletions(-) [2026-11-11T14:52:29Z] queued: the manager of blobstore merges looper/blobstore-19 afte...
+Issue #19 is not finished: the fix is committed and queued to land on main, but no build can run, so it isn't merged, tested or released yet.
+
+- **The fix:** commit 32297cb moves `tacplus.lock` from tacplus 2.6.1 to 2.6.8, at its build image's digest. That image compiles with go1.27.4, which fixes GO-2026-6859. The 2.6 floor is unchanged, and `STATE.md` is updated.
+- **Why it didn't land:** the previous red verdict was not a failed test. Both build jobs so far (pipelines 3053721343 and 3054110148) stopped after 3 hours with no result, because no build runner is picking up jobs. That is tacplus-dev/looper#113, caused by tacplus-dev/cluster#18, which is open and waiting on a decision from Jody. Since 05:00Z every land in the looper repository has failed the same way.
+- **What I did:** I queued the land with the manager once more at 14:52Z. The manager will still merge it after this run if a build goes green. I didn't start another separate build, since it would only add another 3-hour job to the stalled pool. I posted a status comment on #19 and wrote `Blocked-by: tacplus-dev/cluster#18` to the run's outcome file.
+- **Not yet checked:** `just gates` on the new pin, and `govulncheck -mode=binary` on the built `bin/blobstore`. Both need a build job that actually runs.
+- **Still to do:** once the land is green, the next run tags and pushes `v0.1.3` at the landed commit. It can be cut from main because main has only `HISTORY.md` commits since `v0.1.2`. Then it posts the outcome comment and closes #19. There are no `release/*` branches, so nothing needs backporting.
+
+The change touches no service handlers, so the trace-propagation rule doesn't apply.
+= success: Issue #19 is not finished: the fix is committed and queued to land on main, but no build can run, so it isn't merged, tested or released yet.
+
+- **The fix:** commit 32297cb moves `tacplus.lock` from tacplus 2.6.1 to 2.6.8, at its build image's digest. That image compiles with go1.27.4, which fixes GO-2026-6859. The 2.6 floor is unchanged, and `STATE.md` is updated.
+- **Why it didn't land:** the previous red verdict was not a failed test. Both build jobs so far (pipelines 3053721343 and 3054110148) stopped after 3 hours with no result, because no build runner is picking up jobs. That is tacplus-dev/looper#113, caused by tacplus-dev/cluster#18, which is open and waiting on a decision from Jody. Since 05:00Z every land in the looper repository has failed the same way.
+- **What I did:** I queued the land with the manager once more at 14:52Z. The manager will still merge it after this run if a build goes green. I didn't start another separate build, since it would only add another 3-hour job to the stalled pool. I posted a status comment on #19 and wrote `Blocked-by: tacplus-dev/cluster#18` to the run's outcome file.
+- **Not yet checked:** `just gates` on the new pin, and `govulncheck -mode=binary` on the built `bin/blobstore`. Both need a build job that actually runs.
+- **Still to do:** once the land is green, the next run tags and pushes `v0.1.3` at the landed commit. It can be cut from main because main has only `HISTORY.md` commits since `v0.1.2`. Then it posts the outcome comment and closes #19. There are no `release/*` branches, so nothing needs backporting.
+
+The change touches no service handlers, so the trace-propagation rule doesn't apply.
