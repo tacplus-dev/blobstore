@@ -1,0 +1,249 @@
+= init
+> Bash cd /builds/looper/blobstore/issues/18; gh issue view 18 --repo tacplus-dev/blobstore --comments; git status; git log --oneline -3; git diff --stat; git log origin/main --oneline -5; git ls-remote origin 'refs/tags/v0.1.*' 'refs/heads/looper/blobstore-18'
+< author:	jodydadescott association:	member edited:	false status:	none -- Hub triage, 2026-11-08: **approved, priority high** (security, and it fails the release image's build). Run as a non-root user (USER with a fixed UID/GID, e.g. 65532), with the data directory owned by it. Check the other service...
+= thinking_tokens
+= thinking_tokens
+> Bash cd /builds/looper/blobstore/issues/18; git diff; cat justfile | head -80
+< diff --git a/Dockerfile b/Dockerfile index 5ffab92..943cad1 100644 --- a/Dockerfile +++ b/Dockerfile @@ -19,6 +19,17 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \        org.opencontainers.image.description="Content-addressed blob store for the Schematic control plane"    RUN apk add -...
+= thinking_tokens
+= thinking_tokens
+The prior fix is complete; the last land failed only because the build job gave no verdict within 3h (infrastructure, not a red gate). I'll commit, verify with a build job, and land again.
+> Bash cd /builds/looper/blobstore/issues/18; git add -A && git commit -q -F - <<'EOF' Run the release image as non-root 65532:65532 (#18)  The release image ran as root (semgrep missing-user-entrypoint), a security finding that also failed the build's security checks. It now runs as a fixed UID/GID 65532,...
+< b038103 Run the release image as non-root 65532:65532 (#18) [2026-11-11T02:00:15Z] checkpoint of #18 (a step) pushed to looper/blobstore-18:  6 files changed, 144 insertions(+), 4 deletions(-) pid 694
+= thinking_tokens
+= thinking_tokens
+> Bash sleep 300; cat /tmp/build18.log
+= task_started
+= task_notification
+< [2026-11-11T02:00:17Z] checkpoint of #18 (a build) pushed to looper/blobstore-18:  6 files changed, 145 insertions(+), 4 deletions(-) [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of...
+> Bash sleep 580; tail -5 /tmp/build18.log; kill -0 694 && echo running
+= task_started
+= task_notification
+< [2026-11-11T02:00:17Z] checkpoint of #18 (a build) pushed to looper/blobstore-18:  6 files changed, 145 insertions(+), 4 deletions(-) [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of...
+> Bash curl -s https://gitlab.com/api/v4/projects/tacplus-dev%2Fbuild/pipelines/3052478953 | head -c 600; echo; curl -s "https://gitlab.com/api/v4/projects/tacplus-dev%2Fbuild/pipelines/3052478953/jobs" | python3 -I -c 'import json,sys; [print(j["name"],j["status"],j.get("started_at")) for j in json.load(s...
+< {"message":"404 Project Not Found"} Traceback (most recent call last):   File "<string>", line 1, in <module>     import json,sys; [print(j["name"],j["status"],j.get("started_at")) for j in json.load(sys.stdin)]                             ~^^^^^^^^ TypeError: string indices must be integers, not 's...
+Not visible from here; I'll keep polling.
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; tail -15 /tmp/build18.log; kill -0 694 2>/dev/null && echo running
+= task_started
+= task_notification
+< [2026-11-11T02:00:17Z] checkpoint of #18 (a build) pushed to looper/blobstore-18:  6 files changed, 145 insertions(+), 4 deletions(-) [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of...
+= thinking_tokens
+= thinking_tokens
+The build is slow (the last land's build gave no verdict in 3h). Since the land re-runs the same gates and pushes only on green, I'll queue it now rather than wait serially.
+> Bash cd /builds/looper/blobstore/issues/18; /usr/local/bin/repo-looper --repo blobstore --issue 18 --checkpoint "Fix b038103 committed; build job pipeline 3052478953 running since 02:00Z; landing now. Left: land verdict, just gates on main, tag v0.1.3, outcome comment, close." 2>&1 | tail -1 nohup /usr/l...
+< [2026-11-11T02:24:45Z] checkpoint of #18 (a step) pushed to looper/blobstore-18:  6 files changed, 166 insertions(+), 4 deletions(-) pid 4487
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; tail -4 /tmp/build18.log; echo ---; tail -4 /tmp/land18.log
+= task_started
+= task_notification
+< [2026-11-11T02:00:17Z] checkpoint of #18 (a build) pushed to looper/blobstore-18:  6 files changed, 145 insertions(+), 4 deletions(-) [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of...
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; tail -3 /tmp/build18.log; echo ---; tail -2 /tmp/land18.log
+= task_started
+= task_notification
+< [2026-11-11T02:00:17Z] checkpoint of #18 (a build) pushed to looper/blobstore-18:  6 files changed, 145 insertions(+), 4 deletions(-) [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of...
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; tail -1 /tmp/land18.log
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; tail -1 /tmp/land18.log
+= task_started
+= task_notification
+< 02:53Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/bl...
+= task_started
+= task_notification
+< 03:02Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/bl...
+= thinking_tokens
+= thinking_tokens
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; tail -1 /tmp/land18.log
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; tail -1 /tmp/land18.log
+= task_started
+= task_notification
+< 03:12Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/bl...
+= task_started
+= task_notification
+< 03:21Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/bl...
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; tail -1 /tmp/land18.log
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; tail -1 /tmp/land18.log
+= task_started
+= task_notification
+< 03:31Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/bl...
+= task_started
+= task_notification
+< 03:40Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/bl...
+Still waiting at 03:40Z: the build job (pipeline 3052478953, started 02:00Z) has no verdict yet, and the land is queued behind it. I'll keep polling.
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; tail -1 /tmp/land18.log
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; tail -1 /tmp/land18.log
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; tail -1 /tmp/land18.log
+= task_started
+= task_notification
+< 03:50Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- jq: error (at <stdin>:5): object ({"message":...) and string ("<!-- loop...
+= task_started
+= task_notification
+< 04:00Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- jq: error (at <stdin>:5): object ({"message":...) and string ("<!-- loop...
+= task_started
+= task_notification
+< 04:09Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- jq: error (at <stdin>:5): object ({"message":...) and string ("<!-- loop...
+The land's waiter printed a jq error: a GitHub API call probably returned an error object. Checking whether it is still waiting.
+> Bash kill -0 4487 2>/dev/null && echo land-running || echo land-exited; cat /tmp/land18.log; gh api rate_limit --jq .rate; gh issue view 18 --repo tacplus-dev/blobstore --comments | tail -15
+< land-running [2026-11-11T02:24:47Z] checkpoint of #18 (land queued) pushed to looper/blobstore-18:  7 files changed, 171 insertions(+), 4 deletions(-) [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/blobstore-18 after the lands queued before it, one at a time, and says on the i...
+= thinking_tokens
+= thinking_tokens
+The waiter is still alive and the rate limit is fine; its comment poll gets an intermittent API error object and retries. No verdict on the issue yet. Continuing to poll.
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; grep -v '^jq: error' /tmp/land18.log | tail -1
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; grep -v '^jq: error' /tmp/land18.log | tail -1
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; grep -v '^jq: error' /tmp/land18.log | tail -1
+= task_started
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -2 /tmp/build18.log; echo ---; grep -v '^jq: error' /tmp/land18.log | tail -1
+> Bash for i in $(seq 1 19); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -3 /tmp/build18.log; echo ---; grep -v '^jq: error' /tmp/land18.log | tail -2
+= task_notification
+< 04:19Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/bl...
+= task_started
+= task_notification
+< 04:28Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/bl...
+= task_started
+= task_notification
+< 04:38Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/bl...
+= task_started
+= task_notification
+< 04:47Z [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/3052478953 of blobstore b038103, the gates full on base 5eef67e --- [2026-11-11T02:25:20Z] queued: the manager of blobstore merges looper/bl...
+= task_started
+= task_notification
+< 04:57Z [2026-11-11T02:00:17Z] checkpoint of #18 (a build) pushed to looper/blobstore-18:  6 files changed, 145 insertions(+), 4 deletions(-) [2026-11-11T02:00:17Z] build requested: blobstore b038103, the gates full (no gates.yaml) the build job https://gitlab.com/tacplus-dev/build/-/pipelines/305247...
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+The build is approaching 3h with no verdict, the same as the previous land. Before writing this off as infrastructure, I'll check how long #16's land took on the same pipeline.
+> Bash gh issue view 16 --repo tacplus-dev/blobstore --comments | grep -E '^\[20|landed|verdict|pipelines' | head -20
+< The run ended before finishing (exit 0). Its commits are queued with the manager of blobstore, which merges them after the run and gives its verdict here. Its work in progress is on [`looper/blobstore-16`](https://github.com/tacplus-dev/blobstore/tree/looper/blobstore-16). > G704 exception (8454440)...
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+> Bash for r in looper build blobstore; do echo "== $r"; gh search issues --repo tacplus-dev/$r "no verdict" --state open --json number,title,url 2>&1 | head -c 1500; echo; done
+< == looper [{"number":113,"title":"Triggered tacplus-dev/build pipelines never report: no commit status, not even pending, and --build waits 3h for nothing (website 325305c, launcher 88cfeae)","url":"https://github.com/tacplus-dev/looper/issues/113"},{"number":109,"title":"govulncheck in the image is...
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+> Bash gh issue view 113 --repo tacplus-dev/looper --json state,labels,updatedAt,body --jq '.state, ([.labels[].name]|join(",")), .updatedAt, (.body|.[0:1200])'; for i in $(seq 1 8); do kill -0 694 2>/dev/null || break; sleep 30; done; date -u +%H:%MZ; tail -3 /tmp/build18.log
+= task_started
+= task_notification
+< OPEN bug,approved,priority:high,looper:landing 2026-11-11T01:34:56Z ## Actual (2026-11-09) `repo-looper --repo website --issue 2 --build` triggered tacplus-dev/build pipeline 3043233750 for website 325305c (pinned by `build.lock`) at 03:36:35Z. Three hours later, at 06:36Z, it gave up with `no verdi...
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+= thinking_tokens
+> Bash cd /builds/looper/blobstore/issues/18; user="$(grep -E '^USER ' Dockerfile | tail -n1 | awk '{print $2}' || true)"; echo "USER=$user"; test "$user" = "65532:65532" && echo user-check-ok; git stash -q 2>/dev/null; git show origin/main:Dockerfile > /tmp/df-main; u2="$(grep -E '^USER ' /tmp/df-main | t...
+= task_started
+= task_notification
+< USER=65532:65532 user-check-ok main Dockerfile fails the check: 'root' looper-trace: /builds/looper/blobstore/issues/18 verdict: pass (0 handlers, 0 findings)
+= thinking_tokens
+= thinking_tokens
+The gate's USER check passes on the fix and fails on main's Dockerfile, as it should, and looper-trace passes. Next I'll checkpoint, post the comment, and record the block.
+> Bash cd /builds/looper/blobstore/issues/18; command -v semgrep || echo no-semgrep; /usr/local/bin/repo-looper --repo blobstore --issue 18 --checkpoint "Fix b038103 committed, land queued since 02:25Z. Build job pipeline 3052478953 ended 'no verdict within 3h' (tacplus-dev/looper#113: build pipelines neve...
+< /usr/local/bin/semgrep [2026-11-11T05:00:51Z] checkpoint of #18 (a step) pushed to looper/blobstore-18:  7 files changed, 321 insertions(+), 4 deletions(-)
+> Bash cd /builds/looper/blobstore/issues/18; semgrep --config p/default --metrics=off Dockerfile 2>&1 | tail -4
+= task_started
+= task_notification
+< (need more rules? `semgrep login` for additional free Semgrep Registry rules)  If Semgrep missed a finding, please send us feedback to let us know! See https://semgrep.dev/docs/reporting-false-negatives/
+> Bash cd /builds/looper/blobstore/issues/18; semgrep --config p/default --metrics=off Dockerfile 2>&1 | grep -iE 'finding|blocking|missing-user' | head
+= task_started
+= task_notification
+<  • Findings: 0 (0 blocking) Ran 53 rules on 1 file: 0 findings. If Semgrep missed a finding, please send us feedback to let us know!
+> Bash cd /builds/looper/blobstore/issues/18; gh issue comment 18 --repo tacplus-dev/blobstore --body-file - <<'EOF' **Status: the fix is committed and queued to land, but it waits on tacplus-dev/looper#113.**  **The fix:** commit `b038103` on `looper/blobstore-18` (queued with the manager since 02:25Z): -...
+< https://github.com/tacplus-dev/blobstore/issues/18#issuecomment-6787495870 Blocked-by: tacplus-dev/looper#113
+Issue #18 isn't done: the fix is committed and queued to land, but it can't merge yet. The build system never returns a result, which is an open bug in another repository (tacplus-dev/looper#113). So I've marked #18 as blocked on that bug and left it open.
+
+**The fix** is commit `b038103` on `looper/blobstore-18`:
+- **`Dockerfile`:** the image now runs as a fixed non-root user, `USER 65532:65532` (named `blobstore`), and `/app/data` is created owned by that user.
+- **`justfile`:** `just gates` now fails unless the Dockerfile's last `USER` is `65532:65532`, so the image can't drift back to root.
+- **`STATE.md` and `PROPOSALS.md`:** updated. One proposal: the operator should run blobstore's pods as UID/GID 65532 too (`fsGroup` included). Otherwise a data volume owned by root at `/app/data` can't be written and startup fails.
+- **Other services:** an earlier run checked their Dockerfiles and filed opa#10, llmproxy#25, oauth#22, gateway#29, messaging#14 and operator#26.
+
+**Why it's stuck:** the build job I ran on `b038103` ended with `no verdict within 3h`. The previous attempt to land this fix ended the same way, and so did #16's build of main before this change existed, so it isn't caused by the fix. tacplus-dev/looper#113 (open, approved, high priority) describes exactly this: build pipelines never report back. Until it's fixed, the manager can't merge on passing gates, `just gates` can't run on main, and `v0.1.3` can't be tagged.
+
+**What I checked here:**
+- The new USER check passes on the fix and fails on main's Dockerfile (it reads `root` there).
+- semgrep (`p/default`) on the Dockerfile reports 0 findings.
+- `looper-trace check` passes; no handler was touched.
+- I couldn't run the generate/vet/build/test gates or build the image: there's no container runtime here.
+
+**What I did:**
+- Posted a status comment on #18.
+- Wrote `Blocked-by: tacplus-dev/looper#113` to the run's outcome file.
+
+**Still to do once looper#113 is fixed:**
+1. Get the land's verdict.
+2. Run `just gates` on main.
+3. Tag `v0.1.3` and push it.
+4. Post the final comment and close #18.
+
+There are no release branches and main has no new features since `v0.1.2`, so the patch is cut from main.
+= success: Issue #18 isn't done: the fix is committed and queued to land, but it can't merge yet. The build system never returns a result, which is an open bug in another repository (tacplus-dev/looper#113). So I've marked #18 as blocked on that bug and left it open.
+
+**The fix** is commit `b038103` on `looper/blobstore-18`:
+- **`Dockerfile`:** the image now runs as a fixed non-root user, `USER 65532:65532` (named `blobstore`), and `/app/data` is created owned by that user.
+- **`justfile`:** `just gates` now fails unless the Dockerfile's last `USER` is `65532:65532`, so the image can't drift back to root.
+- **`STATE.md` and `PROPOSALS.md`:** updated. One proposal: the operator should run blobstore's pods as UID/GID 65532 too (`fsGroup` included). Otherwise a data volume owned by root at `/app/data` can't be written and startup fails.
+- **Other services:** an earlier run checked their Dockerfiles and filed opa#10, llmproxy#25, oauth#22, gateway#29, messaging#14 and operator#26.
+
+**Why it's stuck:** the build job I ran on `b038103` ended with `no verdict within 3h`. The previous attempt to land this fix ended the same way, and so did #16's build of main before this change existed, so it isn't caused by the fix. tacplus-dev/looper#113 (open, approved, high priority) describes exactly this: build pipelines never report back. Until it's fixed, the manager can't merge on passing gates, `just gates` can't run on main, and `v0.1.3` can't be tagged.
+
+**What I checked here:**
+- The new USER check passes on the fix and fails on main's Dockerfile (it reads `root` there).
+- semgrep (`p/default`) on the Dockerfile reports 0 findings.
+- `looper-trace check` passes; no handler was touched.
+- I couldn't run the generate/vet/build/test gates or build the image: there's no container runtime here.
+
+**What I did:**
+- Posted a status comment on #18.
+- Wrote `Blocked-by: tacplus-dev/looper#113` to the run's outcome file.
+
+**Still to do once looper#113 is fixed:**
+1. Get the land's verdict.
+2. Run `just gates` on main.
+3. Tag `v0.1.3` and push it.
+4. Post the final comment and close #18.
+
+There are no release branches and main has no new features since `v0.1.2`, so the patch is cut from main.
