@@ -22,6 +22,9 @@ gates: generate
   # and the dated planning records (the bracket keeps this line from matching itself).
   upstream="$(git grep -n -I -i -E 'sea[b]eam|sona[r]/' -- . ':!PROVENANCE.md' ':!ROADMAP.md' ':!HISTORY.md' ':!STATE.md' ':!PROPOSALS.md' ':!QUESTIONS.md' || true)"
   test -z "$upstream" || { echo "upstream references:" >&2; echo "$upstream" >&2; exit 1; }
+  # The release image runs as the fixed non-root UID/GID the operator's securityContext names (#18).
+  user="$(grep -E '^USER ' Dockerfile | tail -n1 | awk '{print $2}' || true)"
+  test "$user" = "65532:65532" || { echo "Dockerfile: the last USER must be 65532:65532, not '${user:-root}'" >&2; exit 1; }
   unformatted="$(gofmt -l main.go internal)"
   test -z "$unformatted" || { echo "gofmt needed:" >&2; echo "$unformatted" >&2; exit 1; }
   go vet ./...
