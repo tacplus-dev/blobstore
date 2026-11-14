@@ -1,0 +1,6 @@
+= init
+> Bash cd /builds/looper/blobstore/issues/17; gh issue view 17 --repo tacplus-dev/blobstore --comments | tail -40; gh issue view 108 --repo tacplus-dev/looper --json state,closedAt,labels,title; git log --oneline -3 origin/main; cat security-exceptions.yaml 2>/dev/null
+< author:	jodydadescott association:	member edited:	false status:	none -- **Decided (hub, 2026-11-07, under Jody's delegation):** no per-service exceptions for generated code. Services' SAST skips the generated `tacplus/` tree (tacplus-dev/looper#108, approved, high), and tacplus scans its generated o...
+looper#108 is closed. Building main to confirm the security checks pass.
+> Bash cd /builds/looper/blobstore/issues/17; nohup /usr/local/bin/repo-looper --repo blobstore --issue 17 --build > /tmp/build17.log 2>&1 & echo $!
+< 635
