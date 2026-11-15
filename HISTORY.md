@@ -16,3 +16,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-08 looper issue Security exception needed: gosec G703 (path traversal) false positives in store.go fail the build's security checks (#15, b4b0c58)
 - 2026-11-09 looper issue Security exception needed: gosec G704 (SSRF) false positives in mirror.go's peer forward fail the build's security checks (#16)
 - 2026-11-09 looper release v0.1.2 (https://github.com/tacplus-dev/blobstore/releases/tag/v0.1.2)
+- 2026-11-15 looper release v0.1.3 (https://github.com/tacplus-dev/blobstore/releases/tag/v0.1.3)
