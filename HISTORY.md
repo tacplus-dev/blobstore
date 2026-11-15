@@ -18,3 +18,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-09 looper release v0.1.2 (https://github.com/tacplus-dev/blobstore/releases/tag/v0.1.2)
 - 2026-11-15 looper release v0.1.3 (https://github.com/tacplus-dev/blobstore/releases/tag/v0.1.3)
 - 2026-11-15 looper issue Release image runs as root: semgrep missing-user-entrypoint (HIGH) on Dockerfile:24 fails the build's security checks (#18, 48b18f4)
+- 2026-11-15 looper issue Security exception needed: 213 findings in tacplus-generated code (gosec, gitleaks) fail the build's security checks (#17)
