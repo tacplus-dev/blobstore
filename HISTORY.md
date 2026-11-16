@@ -21,3 +21,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-15 looper issue Security exception needed: 213 findings in tacplus-generated code (gosec, gitleaks) fail the build's security checks (#17)
 - 2026-11-16 looper issue Pin the build: floor 2.6 and a committed tacplus.lock, so the build pipeline and its security checks run on this repository (#14)
 - 2026-11-16 looper issue GO-2026-6859 (net/http HTTP/1 crash): the pinned build image (tacplus 2.6.1) compiles with go1.27.3; re-pin to 2.6.8 (go1.27.4) (#19)
+- 2026-11-16 looper release v0.1.5 (https://github.com/tacplus-dev/blobstore/releases/tag/v0.1.5)
