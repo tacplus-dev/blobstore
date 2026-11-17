@@ -10,3 +10,7 @@ exceptions:
     reason: "gosec taint false positive: the peer forward's host is Config.peers, its path the instance's tid and a validated token (#16)"
     decided_by: "hub (Jody's delegation, 2026-11-07)"
     expires: 2027-02-07
+  - id: DS-0026
+    reason: "trivy no HEALTHCHECK, rule-wide for this repository's Dockerfiles: Kubernetes runs the image and ignores Docker's HEALTHCHECK; health comes from the operator's liveness/readiness probes (#22)"
+    decided_by: "jodydadescott (hub)"
+    expires: 2027-05-17
