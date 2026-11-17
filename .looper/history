@@ -1,0 +1,1 @@
+- 2026-11-17 looper issue New LOW security finding: trivy DS-0026, the release Dockerfile defines no HEALTHCHECK (#22)
