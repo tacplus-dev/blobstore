@@ -59,6 +59,22 @@ func (s *Store) Path(group, hash string) string {
 	return filepath.Join(s.root, group, hash)
 }
 
+// checkedPath is Path for the calls that hand a caller's group and hash to the
+// filesystem (Open, Remove), which refuse a key rather than trust every caller
+// to have gone through ParseBlobKey (#21). validateBlobKey is the real gate;
+// the IsLocal and ".." checks after it are the form CodeQL's go/path-injection
+// recognises as a sanitizer, which an error-returning validator is not.
+func (s *Store) checkedPath(group, hash string) (string, error) {
+	if err := validateBlobKey(group, hash); err != nil {
+		return "", err
+	}
+	rel := filepath.Join(group, hash)
+	if !filepath.IsLocal(rel) || strings.Contains(rel, "..") {
+		return "", fmt.Errorf("blob path %q is outside the data directory", rel)
+	}
+	return filepath.Join(s.root, rel), nil
+}
+
 // Has reports whether the promoted file exists.
 func (s *Store) Has(group, hash string) bool {
 	st, err := os.Stat(s.Path(group, hash))
@@ -69,7 +85,10 @@ func (s *Store) Has(group, hash string) bool {
 // is deliberately what comes back rather than an io.Reader: the `/b/` path
 // serves Range requests through http.ServeContent, which needs a ReadSeeker.
 func (s *Store) Open(group, hash string) (*os.File, os.FileInfo, error) {
-	p := s.Path(group, hash)
+	p, err := s.checkedPath(group, hash)
+	if err != nil {
+		return nil, nil, err
+	}
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, nil, err
@@ -83,9 +102,14 @@ func (s *Store) Open(group, hash string) (*os.File, os.FileInfo, error) {
 }
 
 // Remove unlinks a promoted file. A missing file is not an error: DeleteBlob is
-// idempotent, and the peer may already have been asked to delete it.
+// idempotent, and the peer may already have been asked to delete it. A key
+// that is not a blob key is.
 func (s *Store) Remove(group, hash string) error {
-	err := os.Remove(s.Path(group, hash))
+	p, err := s.checkedPath(group, hash)
+	if err != nil {
+		return err
+	}
+	err = os.Remove(p)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}

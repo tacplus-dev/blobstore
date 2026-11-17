@@ -1,6 +1,9 @@
 package blobstore
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -200,6 +203,53 @@ func TestBlobKeyRoundTripsAndRefusesTraversal(t *testing.T) {
 		if _, err := ParseBlobKey(bad); err == nil {
 			t.Errorf("%s: %q was accepted", name, bad)
 		}
+	}
+}
+
+// Store.Open and Store.Remove refuse a group or hash that is not a blob key
+// themselves, rather than trusting every caller to have parsed one (#21): a
+// key that would reach outside data_dir neither opens nor unlinks anything.
+func TestStoreOpenAndRemoveRefuseAKeyOutsideTheDataDir(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "data")
+	s, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("outside data_dir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash := strings.Repeat("a", 64)
+	for name, k := range map[string]BlobKey{
+		"parent group":       {Group: "..", Hash: "victim"},
+		"traversal hash":     {Group: "documents", Hash: "../../victim"},
+		"absolute hash":      {Group: "documents", Hash: victim},
+		"separator in group": {Group: "../data", Hash: hash},
+		"dot group":          {Group: ".", Hash: hash},
+		"empty group":        {Group: "", Hash: hash},
+		"short hash":         {Group: "documents", Hash: "abc"},
+		"uppercase hash":     {Group: "documents", Hash: strings.Repeat("A", 64)},
+	} {
+		if f, _, err := s.Open(k.Group, k.Hash); err == nil {
+			f.Close()
+			t.Errorf("%s: Open(%q, %q) was accepted", name, k.Group, k.Hash)
+		}
+		if err := s.Remove(k.Group, k.Hash); err == nil {
+			t.Errorf("%s: Remove(%q, %q) was accepted", name, k.Group, k.Hash)
+		}
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatalf("the file outside data_dir is gone: %v", err)
+	}
+
+	// A valid key still reaches the store: a missing blob is ErrNotExist to
+	// Open and done to Remove (DeleteBlob is idempotent).
+	if _, _, err := s.Open("documents", hash); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Open of a missing valid key: got %v, want ErrNotExist", err)
+	}
+	if err := s.Remove("documents", hash); err != nil {
+		t.Errorf("Remove of a missing valid key: %v", err)
 	}
 }
 
