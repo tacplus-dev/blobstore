@@ -25,3 +25,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-16 looper issue STATE.md is stale: Blocked on names tacplus-dev/tacplus#188, which is closed (#20)
 - 2026-11-17 looper issue CodeQL go/path-injection (HIGH) false positives on Store.Open/Store.Remove fail the build's security checks (#21)
 - 2026-11-17 looper issue New LOW security finding: trivy DS-0026, the release Dockerfile defines no HEALTHCHECK (#22)
+- 2026-11-22 looper issue Pinned images behind their lines: relock (tacplus.lock: tacplus 2.6.8 → 2.6.13, and 1 more) (#23)
