@@ -24,3 +24,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-16 looper release v0.1.5 (https://github.com/tacplus-dev/blobstore/releases/tag/v0.1.5)
 - 2026-11-16 looper issue STATE.md is stale: Blocked on names tacplus-dev/tacplus#188, which is closed (#20)
 - 2026-11-17 looper issue CodeQL go/path-injection (HIGH) false positives on Store.Open/Store.Remove fail the build's security checks (#21)
+- 2026-11-17 looper issue New LOW security finding: trivy DS-0026, the release Dockerfile defines no HEALTHCHECK (#22)
