@@ -3,7 +3,9 @@
 
 # The base is a build argument: a fleet may hand in its own hardened base, the
 # default is the public one (no private registry in a public contract's repo).
-ARG BASE_IMAGE=alpine:3.24
+# Pinned by digest, never a floating tag, so a rebuild ships the base that was
+# scanned (#25, dockerfile_test.go); nightly maintenance moves the digest.
+ARG BASE_IMAGE=alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 FROM ${BASE_IMAGE}
 
 ARG BUILD_DATE
