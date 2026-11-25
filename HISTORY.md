@@ -28,3 +28,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-22 looper issue Pinned images behind their lines: relock (tacplus.lock: tacplus 2.6.8 → 2.6.13, and 1 more) (#23)
 - 2026-11-23 looper issue Pinned images behind their lines: relock (tacplus.lock: tacplus 2.6.13 → 2.6.14, and 1 more) (#24)
 - 2026-11-25 looper release v0.1.10 (https://github.com/tacplus-dev/blobstore/releases/tag/v0.1.10)
+- 2026-11-25 looper issue Pinned images behind their lines: relock (Dockerfile: alpine:3.24 → alpine:3.24) (#26)
