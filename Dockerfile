@@ -3,7 +3,7 @@
 
 # The base is a build argument: a fleet may hand in its own hardened base, the
 # default is the public one (no private registry in a public contract's repo).
-ARG BASE_IMAGE=alpine:3.24
+ARG BASE_IMAGE=alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 FROM ${BASE_IMAGE}
 
 ARG BUILD_DATE
