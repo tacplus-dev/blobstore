@@ -453,18 +453,26 @@ func TestRecordsRouteEveryCallToItsTenant(t *testing.T) {
 	}
 }
 
-func TestRecordsReadsRoutedToAnotherTenantFindNothing(t *testing.T) {
+// The generated client reads its own tenant from its token's tid claim and
+// refuses a call routed to any other before it is sent: S2S never crosses
+// tenants (tacplus-dev/tacplus#284).
+func TestRecordsReadsRoutedToAnotherTenantAreRefusedBeforeTheyAreSent(t *testing.T) {
 	ours, theirs := recordCasesFor(testTenant), recordCasesFor(otherTenant)
 	for i := range ours {
 		t.Run(ours[i].name, func(t *testing.T) {
-			records, _ := newStratumRecords(t)
+			records, fake := newStratumRecords(t)
 			ctx := context.Background()
 			if err := ours[i].insert(ctx, records, ours[i].row); err != nil {
 				t.Fatalf("write in its own tenant: %v", err)
 			}
 			got, err := theirs[i].read(ctx, records)
-			if err != nil || got != nil {
-				t.Fatalf("read routed to %s: got %v, %v; want nil, nil", otherTenant, got, err)
+			if !errors.Is(err, ErrRecordOutsideTenant) || got != nil {
+				t.Fatalf("read routed to %s: got %v, %v; want ErrRecordOutsideTenant", otherTenant, got, err)
+			}
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			if len(fake.routed) != 1 || fake.routed[0] != testTenant {
+				t.Fatalf("the store saw calls %v, want only the write in %s", fake.routed, testTenant)
 			}
 		})
 	}

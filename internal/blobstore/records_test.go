@@ -2,6 +2,8 @@ package blobstore
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	wrapperToken "github.com/tacplus-dev/blobstore/tacplus/chassis/token"
 	query_gc "github.com/tacplus-dev/blobstore/tacplus/s2sm/grpc/clients/vservices/query"
 	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
 	query_pb "github.com/tacplus-dev/blobstore/tacplus/types/vservices/query"
@@ -534,8 +537,28 @@ func newStratumRecords(t *testing.T) (*recordStore, *fakeStratum) {
 		t.Fatalf("dialling the fake stratum: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	client := query_gc.NewRecordMapClient(conn, func() (string, error) { return "test-token", nil })
+	own := ownToken(t, testNS, testTenant)
+	client := query_gc.NewRecordMapClient(conn, func() (string, error) { return own, nil })
 	return NewRecords(client, testNS).(*recordStore), fake
+}
+
+// ownToken is the instance's own service token as the generated client reads
+// it: a service of the tenant whose namespace is namespace and whose tid claim
+// is tid. The client reads its own tenant from it to stamp and check every
+// route field (tacplus-dev/tacplus#284); the target verifies it, so here it is
+// encoded but not signed.
+func ownToken(t *testing.T, namespace, tid string) string {
+	t.Helper()
+	tok := wrapperToken.NewImmutableToken(nil).SetAlg("none").SetIssuer("kernel").
+		SetSubType("service").SetSubject("blobstore").SetNamespace(namespace).SetTid(tid)
+	part := func(claims map[string]string) string {
+		raw, err := json.Marshal(claims)
+		if err != nil {
+			t.Fatalf("encoding a token part: %v", err)
+		}
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	return part(tok.Proto().GetHeader()) + "." + part(tok.Proto().GetPayload()) + ".unsigned"
 }
 
 // recordCase is one record type's slice of the surface: insert one row, read it
