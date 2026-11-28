@@ -70,10 +70,11 @@ func run() error {
 		return fmt.Errorf("fetching blobstore config from BlobstoreConfigState: %w", err)
 	}
 
-	// blobstore is tenant-owned (#9): this instance serves the one tenant whose
-	// namespace, /tenants/<tid>, its own service token names. Anywhere else (a
-	// /system deployment above all) it has no tenant and does not start.
-	tenant, err := instanceTenant(s)
+	// blobstore is tenant-owned (#9): this instance serves the one tenant its own
+	// service token's tid claim names, in that tenant's namespace, /tenants/<name>.
+	// Anywhere else (a /system deployment above all) it has no tenant and does not
+	// start.
+	tenant, namespace, err := instanceTenant(s)
 	if err != nil {
 		return err
 	}
@@ -93,9 +94,9 @@ func run() error {
 	// Reads and writes alike go to stratum's record plane: its write surface is
 	// the only way a row reaches the store (#6). Every call is routed to this
 	// instance's own tenant's Stratum.
-	records := internal.NewRecords(s.Grpc().Clients().Vservices().RecordMapClient())
+	records := internal.NewRecords(s.Grpc().Clients().Vservices().RecordMapClient(), namespace)
 
-	svc := internal.NewService(store, mirror, records, tenant, time.Now)
+	svc := internal.NewService(store, mirror, records, tenant, namespace, time.Now)
 	handler := internal.NewHandler(svc)
 
 	// The config the generated lifecycle will deliver is the authority, but the
@@ -127,19 +128,23 @@ func run() error {
 	return s.Run(handler)
 }
 
-// instanceTenant is the tid of the tenant this instance serves, from the
-// namespace of its own service token: the same identity the generated door pins
-// itself to.
-func instanceTenant(s *sm.ServiceManager) (string, error) {
+// instanceTenant is the tid of the tenant this instance serves, from the tid
+// claim of its own service token, and that tenant's namespace, its namespace
+// claim: the same identity the generated door pins itself to.
+func instanceTenant(s *sm.ServiceManager) (string, string, error) {
 	raw, err := s.GetToken()
 	if err != nil {
-		return "", fmt.Errorf("reading this instance's own token: %w", err)
+		return "", "", fmt.Errorf("reading this instance's own token: %w", err)
 	}
 	tok, err := tokenchassis.ParseToken(raw)
 	if err != nil {
-		return "", fmt.Errorf("parsing this instance's own token: %w", err)
+		return "", "", fmt.Errorf("parsing this instance's own token: %w", err)
 	}
-	return internal.InstanceTenant(tok.GetNamespace())
+	tenant, err := internal.InstanceTenant(tok.GetTid(), tok.GetNamespace())
+	if err != nil {
+		return "", "", err
+	}
+	return tenant, tok.GetNamespace(), nil
 }
 
 // serveHTTP binds one plaintext listener and serves it in the background.

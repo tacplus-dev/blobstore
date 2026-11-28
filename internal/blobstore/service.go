@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/tacplus-dev/blobstore/tacplus/chassis/serviceconnection"
 	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
 	"go.uber.org/zap"
 )
@@ -32,11 +34,15 @@ type Service struct {
 	now     func() time.Time
 
 	// tenant is the tid of the one tenant this instance serves: blobstore is
-	// tenant_owned (#9), and its instance in /tenants/<tid> holds and serves
-	// only that tenant's blobs. Every record call is routed to it, a byte path
-	// under any other tid is a 404, and an RPC routed to, naming or called from
-	// any other tenant is refused.
+	// tenant_owned (#9), and its instance holds and serves only that tenant's
+	// blobs. Every record call is routed to it, a byte path under any other tid
+	// is a 404, and an RPC routed to or called from any other tenant is refused.
 	tenant string
+
+	// namespace is that tenant's namespace, /tenants/<name>: it names the
+	// tenant, never its tid (tacplus-dev/tacplus#284). Every RPC names it, and
+	// every row is kept in it.
+	namespace string
 
 	// cfg is swapped wholesale on every config delivery. An atomic pointer rather
 	// than a mutex-guarded struct: every request reads it and none of them mutates
@@ -62,37 +68,48 @@ type runtimeConfig struct {
 	sessionSweep time.Duration
 }
 
-// NewService builds the service of tenant's instance. It does NOT read config:
-// Configure does, and it is called by the generated handler before the server
-// starts and again on every update.
-func NewService(store *Store, mirror *Mirror, records Records, tenant string, now func() time.Time) *Service {
+// NewService builds the service of the instance of tenant, the tid of the tenant
+// whose namespace is namespace. It does NOT read config: Configure does, and it
+// is called by the generated handler before the server starts and again on
+// every update.
+func NewService(store *Store, mirror *Mirror, records Records, tenant, namespace string, now func() time.Time) *Service {
 	if now == nil {
 		now = time.Now
 	}
 	return &Service{
-		store:   store,
-		mirror:  mirror,
-		records: records,
-		quota:   NewQuota(records),
-		stats:   NewStats(records, tenant, now),
-		now:     now,
-		tenant:  tenant,
+		store:     store,
+		mirror:    mirror,
+		records:   records,
+		quota:     NewQuota(records),
+		stats:     NewStats(records, tenant, now),
+		now:       now,
+		tenant:    tenant,
+		namespace: namespace,
 	}
 }
 
 // Tenant is the tid of the tenant this instance serves.
 func (s *Service) Tenant() string { return s.tenant }
 
-// InstanceTenant is the tenant of an instance whose own identity is in
-// namespace: the tid of exactly /tenants/<tid>. blobstore runs nowhere else (#9):
-// in /system, or anywhere that is not one tenant's own namespace, it has no
-// tenant to serve and refuses to start.
-func InstanceTenant(namespace string) (string, error) {
-	tid, ok := NamespaceTenant(namespace)
-	if !ok || namespace != "/tenants/"+tid {
-		return "", fmt.Errorf("blobstore is tenant-owned and runs only in a tenant's namespace /tenants/<tid>, not in %q", namespace)
+// Namespace is the namespace of the tenant this instance serves.
+func (s *Service) Namespace() string { return s.namespace }
+
+// InstanceTenant is the tenant of an instance from its own token's claims: tid,
+// its tid claim, which kernel stamps on every token in a tenant, and namespace,
+// which must be exactly the tenant's own, /tenants/<name>. The tid is never
+// derived from the namespace (tacplus-dev/tacplus#284). blobstore runs nowhere
+// else (#9): in /system, or anywhere that is not one tenant's own namespace, or
+// with no tid claim, it has no tenant to serve and refuses to start.
+func InstanceTenant(tid, namespace string) (string, error) {
+	name, ok := strings.CutPrefix(namespace, "/tenants/")
+	if !ok || name == "" || strings.Contains(name, "/") {
+		return "", fmt.Errorf("blobstore is tenant-owned and runs only in a tenant's namespace /tenants/<name>, not in %q", namespace)
 	}
-	return tid, nil
+	tenant, ok := serviceconnection.CallerTenant(tid)
+	if !ok {
+		return "", fmt.Errorf("blobstore runs in %q, but its token's tid claim %q is not a tenant id", namespace, tid)
+	}
+	return tenant, nil
 }
 
 // Configure resolves a delivered Config into the snapshot requests read.

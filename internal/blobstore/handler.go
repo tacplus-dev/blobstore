@@ -8,6 +8,7 @@ import (
 
 	"github.com/tacplus-dev/blobstore/tacplus/chassis/collection"
 
+	"github.com/tacplus-dev/blobstore/tacplus/chassis/serviceconnection"
 	"github.com/tacplus-dev/blobstore/tacplus/chassis/servicemanager"
 	blobstore_fe "github.com/tacplus-dev/blobstore/tacplus/s2sm/grpc/servers/services/blobstore"
 	blobstore_pb "github.com/tacplus-dev/blobstore/tacplus/types/services/blobstore"
@@ -49,17 +50,24 @@ func (h *Handler) Service() *Service { return h.svc }
 // callers at or above the tenant and in /system; target_namespace_field then
 // holds the caller to the request's namespace or above, which no /system caller
 // is. This is the same rule said once more, whatever the request names: a
-// caller whose namespace is not in /tenants/<tid> of this instance — /system, the
-// root, another tenant — is refused before a row is read. /system never holds,
+// caller whose tid claim is not this instance's tid, or whose namespace is not
+// in this instance's tenant's namespace — /system, the root, another tenant —
+// is refused before a row is read. The caller's tenant is its tid claim alone,
+// never read from its namespace, which names the tenant (tacplus-dev/tacplus#284),
+// and a caller without one is refused, fail closed. /system never holds,
 // serves or reaches a tenant's blobs. What is left after it is the SERVICE half:
 // that this caller is the one that owns this row (R6).
 func (h *Handler) callerPrincipal(caller *servicemanager.Caller) (string, error) {
 	if caller == nil || caller.Token() == nil {
 		return "", status.Error(codes.Unauthenticated, "no caller identity")
 	}
-	if !inTenant(h.svc.tenant, caller.Token().GetNamespace()) {
+	if tid, ok := serviceconnection.CallerTenant(caller.Token().GetTid()); !ok || tid != h.svc.tenant {
 		return "", status.Errorf(codes.PermissionDenied,
-			"caller namespace %q is not in this instance's tenant %s", caller.Token().GetNamespace(), h.svc.tenant)
+			"caller tid claim %q is not this instance's tenant %s", caller.Token().GetTid(), h.svc.tenant)
+	}
+	if !inNamespace(h.svc.namespace, caller.Token().GetNamespace()) {
+		return "", status.Errorf(codes.PermissionDenied,
+			"caller namespace %q is not in this instance's tenant's namespace %s", caller.Token().GetNamespace(), h.svc.namespace)
 	}
 	path, err := caller.Token().ServicePath()
 	if err != nil {
@@ -87,7 +95,7 @@ func requireOwner(rowOwner, rowNamespace, caller, namespace, what string) error 
 //
 // A request routed to another tenant is that tenant's instance's to answer: the
 // generated server refuses it before the handler (PERMISSION_DENIED), and so does
-// this. The namespace must be the tenant's own, /tenants/<tid>: the instance
+// this. The namespace must be the tenant's own, /tenants/<name>: the instance
 // keeps rows in no other, and its disks have no namespace level to keep them
 // apart.
 func (h *Handler) requestTenant(tenant, namespace string) (string, error) {
@@ -95,9 +103,9 @@ func (h *Handler) requestTenant(tenant, namespace string) (string, error) {
 		return "", status.Errorf(codes.PermissionDenied,
 			"request routed to tenant %q reached the instance of tenant %s", tenant, h.svc.tenant)
 	}
-	if namespace != "/tenants/"+tenant {
+	if namespace != h.svc.namespace {
 		return "", status.Errorf(codes.InvalidArgument,
-			"namespace %q is not tenant %s's (/tenants/%s): blobstore keeps rows only in its tenant's namespace", namespace, tenant, tenant)
+			"namespace %q is not tenant %s's (%s): blobstore keeps rows only in its tenant's namespace", namespace, tenant, h.svc.namespace)
 	}
 	return tenant, nil
 }

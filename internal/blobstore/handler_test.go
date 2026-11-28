@@ -23,11 +23,15 @@ import (
 // already run by then — the tenant door and target_namespace_field — so what
 // these tests exercise is the handler's: is the caller of this instance's
 // tenant, and is it the row's owner (R6).
-func callerFor(service string) *servicemanager.Caller { return callerIn(service, testNS) }
+func callerFor(service string) *servicemanager.Caller { return callerIn(service, testNS, testTenant) }
 
-// callerIn is callerFor for a service whose token namespace is namespace.
-func callerIn(service, namespace string) *servicemanager.Caller {
+// callerIn is callerFor for a service whose token namespace is namespace and
+// whose tid claim, kernel's stamp of its tenant's tid, is tid ("" for none).
+func callerIn(service, namespace, tid string) *servicemanager.Caller {
 	tok := wrapperToken.NewImmutableToken(nil).SetSubType("service").SetSubject(service).SetNamespace(namespace)
+	if tid != "" {
+		tok = tok.SetTid(tid)
+	}
 	return servicemanager.NewCaller(tok, "test-request")
 }
 

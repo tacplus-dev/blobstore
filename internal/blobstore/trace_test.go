@@ -40,7 +40,7 @@ func newTracedHandler(t *testing.T) (*Handler, *fakeStratum) {
 	if err != nil {
 		t.Fatalf("NewMirror: %v", err)
 	}
-	svc := NewService(store, mirror, records, testTenant, nil)
+	svc := NewService(store, mirror, records, testTenant, testNS, nil)
 	if err := svc.Configure(testConfig()); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}

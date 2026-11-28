@@ -13,7 +13,7 @@ in that doc and the code cites them as `R1`…`R13`.
 ## The shape, in one paragraph
 
 One instance per tenant (#9): blobstore is `tenant_owned`, so each tenant has
-its own instance in `/tenants/<tid>`, with its own two pods, its own PVCs and
+its own instance in `/tenants/<name>`, with its own two pods, its own PVCs and
 its own Stratum for the metadata. Nothing in `/system` holds or serves a
 tenant's blobs, and no instance calls into another tenant (tacplus-dev/roadmap
 `decisions/s2s-never-crosses-tenants-2026-10-31.md`, addendum 2026-11-01). The

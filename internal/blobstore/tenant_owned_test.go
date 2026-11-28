@@ -16,7 +16,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// blobstore is tenant-owned (#9): one instance per tenant, in /tenants/<tid>,
+// blobstore is tenant-owned (#9): one instance per tenant, in /tenants/<name>,
 // with its own two pods, its own disks and its own Stratum. These tests stand
 // up two tenants' instances side by side, each a real pair over its own temp
 // directories and its own fake Stratum, and check that nothing of one tenant's
@@ -24,8 +24,20 @@ import (
 
 const (
 	otherTenant = "other001"
-	otherNS     = "/tenants/" + otherTenant
+	otherNS     = "/tenants/other"
 )
+
+// tenantNS is the namespace of the tenant whose tid is tid, as kernel resolves
+// it: "" for a tid of no tenant here.
+func tenantNS(tid string) string {
+	switch tid {
+	case testTenant:
+		return testNS
+	case otherTenant:
+		return otherNS
+	}
+	return ""
+}
 
 // twoTenants is testTenant's instance and otherTenant's.
 func twoTenants(t *testing.T) (ours, theirs *pair) {
@@ -37,7 +49,7 @@ func twoTenants(t *testing.T) (ours, theirs *pair) {
 // PUTs body to the path it handed out, at that instance's pod a.
 func (p *pair) createAndPut(t *testing.T, body []byte) *blobstore_pb.CreateUploadResponse {
 	t.Helper()
-	up, err := NewHandler(p.a).CreateUpload(context.Background(), callerIn("docmanager", p.ns()), &blobstore_pb.CreateUploadRequest{
+	up, err := NewHandler(p.a).CreateUpload(context.Background(), callerIn("docmanager", p.ns(), p.tenant), &blobstore_pb.CreateUploadRequest{
 		Group: testGroup, ContentHash: sha256Hex(body), SizeBytes: int64(len(body)),
 		ContentType: "application/pdf", Namespace: p.ns(), Tenant: p.tenant,
 	})
@@ -111,7 +123,7 @@ func TestEachTenantsUploadsLandOnItsOwnInstancesDisks(t *testing.T) {
 func TestALinkTokenAtAnotherTenantsInstanceOrPathIs404(t *testing.T) {
 	ours, theirs := twoTenants(t)
 	up := ours.createAndPut(t, pdfBody)
-	link, err := NewHandler(ours.a).CreateLink(context.Background(), callerIn("docmanager", testNS), &blobstore_pb.CreateLinkRequest{
+	link, err := NewHandler(ours.a).CreateLink(context.Background(), callerIn("docmanager", testNS, testTenant), &blobstore_pb.CreateLinkRequest{
 		BlobId: up.GetBlobId(), Filename: "x.pdf", Namespace: testNS, Tenant: testTenant,
 	})
 	if err != nil {
@@ -144,7 +156,7 @@ func TestALinkTokenAtAnotherTenantsInstanceOrPathIs404(t *testing.T) {
 
 func TestAnUploadTokenAtAnotherTenantsInstanceOrPathIs404(t *testing.T) {
 	ours, theirs := twoTenants(t)
-	up, err := NewHandler(ours.a).CreateUpload(context.Background(), callerIn("docmanager", testNS), &blobstore_pb.CreateUploadRequest{
+	up, err := NewHandler(ours.a).CreateUpload(context.Background(), callerIn("docmanager", testNS, testTenant), &blobstore_pb.CreateUploadRequest{
 		Group: testGroup, ContentHash: pdfHash(), SizeBytes: int64(len(pdfBody)),
 		ContentType: "application/pdf", Namespace: testNS, Tenant: testTenant,
 	})
@@ -283,13 +295,22 @@ func TestASystemCallerCannotReachATenantsBlobs(t *testing.T) {
 
 	// Whatever a caller outside the tenant names, it is refused before a row is
 	// read: /system (a platform service), the root, and another tenant's
-	// service. The generated door lets /system in; this instance does not.
-	for _, callerNS := range []string{"/system", "/system/aws/az1", "/", otherNS} {
-		caller := callerIn("docmanager", callerNS)
+	// service. The generated door lets /system in; this instance does not. The
+	// caller's tenant is its tid claim alone (tacplus-dev/tacplus#284): a caller
+	// in this tenant's namespace with no claim, or another tenant's, is refused,
+	// and so is a tenant named like this tenant's tid.
+	for _, c := range []struct{ ns, tid string }{
+		{"/system", ""}, {"/system/aws/az1", ""}, {"/", ""},
+		{otherNS, otherTenant},
+		{testNS, ""}, {testNS, otherTenant}, {testNS, "ACME0001"},
+		{"/tenants/" + testTenant, otherTenant}, {"/tenants/" + testTenant, ""},
+		{otherNS, testTenant},
+	} {
+		caller := callerIn("docmanager", c.ns, c.tid)
 		for name, call := range rpcCalls(p, blobID, tokenHash, uploadID) {
-			for _, ns := range []string{testNS, callerNS} {
+			for _, ns := range []string{testNS, c.ns} {
 				if err := call(caller, ns, testTenant); codeOf(err) != codes.PermissionDenied {
-					t.Errorf("%s from %s naming %s: got %v, want PermissionDenied", name, callerNS, ns, err)
+					t.Errorf("%s from %s (tid %q) naming %s: got %v, want PermissionDenied", name, c.ns, c.tid, ns, err)
 				}
 			}
 		}
@@ -301,7 +322,7 @@ func TestRPCsRoutedToAnotherTenantAreRefused(t *testing.T) {
 	p := newPair(t)
 	blobID, tokenHash, uploadID := tenantFixture(t, p)
 	before := p.records.snapshot()
-	caller := callerIn("docmanager", testNS)
+	caller := callerIn("docmanager", testNS, testTenant)
 
 	for name, call := range rpcCalls(p, blobID, tokenHash, uploadID) {
 		// A request whose route field names another tenant is that tenant's: the
@@ -310,7 +331,7 @@ func TestRPCsRoutedToAnotherTenantAreRefused(t *testing.T) {
 			t.Errorf("%s routed to %s: got %v, want PermissionDenied", name, otherTenant, err)
 		}
 		// A namespace that is not this tenant's own has no rows here.
-		for _, ns := range []string{"/", "/system", otherNS, testNS + "/sub", "/tenants/ACME0001"} {
+		for _, ns := range []string{"/", "/system", otherNS, testNS + "/sub", "/tenants/ACME0001", "/tenants/" + testTenant} {
 			if err := call(caller, ns, testTenant); codeOf(err) != codes.InvalidArgument {
 				t.Errorf("%s naming %s: got %v, want InvalidArgument", name, ns, err)
 			}
@@ -327,7 +348,7 @@ func TestQuotaIsEnforcedPerTenant(t *testing.T) {
 	ours, theirs := twoTenants(t)
 	ctx := context.Background()
 	reserve := func(p *pair, size int64) error {
-		_, err := NewHandler(p.a).CreateUpload(ctx, callerIn("docmanager", p.ns()), &blobstore_pb.CreateUploadRequest{
+		_, err := NewHandler(p.a).CreateUpload(ctx, callerIn("docmanager", p.ns(), p.tenant), &blobstore_pb.CreateUploadRequest{
 			Group: testGroup, ContentHash: strings.Repeat("b", 64), SizeBytes: size,
 			ContentType: "application/pdf", Namespace: p.ns(), Tenant: p.tenant,
 		})
@@ -498,15 +519,27 @@ func TestRecordsCallsNamingNoTenantAreRefused(t *testing.T) {
 // The instance's tenant, from its own identity
 // ---------------------------------------------------------------------------
 
-// An instance serves the tenant of exactly /tenants/<tid>; anywhere else (in
-// /system above all) it has no tenant and must not start.
+// An instance serves the tenant of its token's tid claim, in exactly its
+// tenant's own namespace /tenants/<name>; anywhere else (in /system above all),
+// or with no tid claim, it has no tenant and must not start. The tid is never
+// read from the namespace (tacplus-dev/tacplus#284).
 func TestInstanceTenantIsOnlyATenantsOwnNamespace(t *testing.T) {
-	if tid, err := InstanceTenant(testNS); err != nil || tid != testTenant {
-		t.Fatalf("InstanceTenant(%q) = %q, %v; want %q", testNS, tid, err, testTenant)
+	for _, c := range []struct{ tid, ns string }{
+		{testTenant, testNS},
+		{otherTenant, "/tenants/" + testTenant},
+	} {
+		if tid, err := InstanceTenant(c.tid, c.ns); err != nil || tid != c.tid {
+			t.Errorf("InstanceTenant(%q, %q) = %q, %v; want %q", c.tid, c.ns, tid, err, c.tid)
+		}
 	}
-	for _, ns := range []string{"", "/", "/system", "/system/aws/az1", "/tenants", testNS + "/sub", "/tenants/ACME0001", "/tenants/acme"} {
-		if tid, err := InstanceTenant(ns); err == nil {
-			t.Errorf("InstanceTenant(%q) = %q; want a refusal", ns, tid)
+	for _, ns := range []string{"", "/", "/system", "/system/aws/az1", "/tenants", "/tenants/", testNS + "/sub"} {
+		if tid, err := InstanceTenant(testTenant, ns); err == nil {
+			t.Errorf("InstanceTenant(%q, %q) = %q; want a refusal", testTenant, ns, tid)
+		}
+	}
+	for _, claim := range []string{"", "ACME0001", "acme", testTenant + "x"} {
+		if tid, err := InstanceTenant(claim, "/tenants/"+testTenant); err == nil {
+			t.Errorf("InstanceTenant(%q, %q) = %q; want a refusal", claim, "/tenants/"+testTenant, tid)
 		}
 	}
 }

@@ -102,8 +102,8 @@ func newTenantPair(t *testing.T, tenant string) *pair {
 	return p
 }
 
-// ns is the instance's tenant's namespace, /tenants/<tid>.
-func (p *pair) ns() string { return "/tenants/" + p.tenant }
+// ns is the instance's tenant's namespace, /tenants/<name>.
+func (p *pair) ns() string { return tenantNS(p.tenant) }
 
 // newPod builds one Service over a fresh temp directory.
 //
@@ -122,7 +122,7 @@ func (p *pair) newPod(t *testing.T, self, selfAddr, peerAddr string) *Service {
 	if err != nil {
 		t.Fatalf("NewMirror: %v", err)
 	}
-	svc := NewService(store, mirror, p.records, p.tenant, func() time.Time {
+	svc := NewService(store, mirror, p.records, p.tenant, p.ns(), func() time.Time {
 		return time.UnixMilli(p.nowMs)
 	})
 	if err := svc.Configure(testConfig()); err != nil {
@@ -330,7 +330,7 @@ func fakeRead[T interface{ GetNamespace() string }](f *fakeRecords, tenant strin
 	if f.failReads {
 		return none, errFakeStratum
 	}
-	if !inTenant(tenant, row.GetNamespace()) {
+	if !inNamespace(tenantNS(tenant), row.GetNamespace()) {
 		return none, nil
 	}
 	return row, nil
@@ -345,7 +345,7 @@ func fakeList[T interface{ GetNamespace() string }](f *fakeRecords, tenant strin
 	}
 	var out []T
 	for _, row := range rows {
-		if inTenant(tenant, row.GetNamespace()) && keep(row) {
+		if inNamespace(tenantNS(tenant), row.GetNamespace()) && keep(row) {
 			out = append(out, row)
 		}
 	}
@@ -357,7 +357,7 @@ func (f *fakeRecords) writable(tenant string, rows ...interface{ GetNamespace() 
 		return err
 	}
 	for _, row := range rows {
-		if !inTenant(tenant, row.GetNamespace()) {
+		if !inNamespace(tenantNS(tenant), row.GetNamespace()) {
 			return fmt.Errorf("fake stratum of %s: row of %q: %w", tenant, row.GetNamespace(), ErrRecordOutsideTenant)
 		}
 	}

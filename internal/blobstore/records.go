@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"strings"
 
 	"github.com/tacplus-dev/blobstore/tacplus/chassis/serviceconnection"
 	query_gc "github.com/tacplus-dev/blobstore/tacplus/s2sm/grpc/clients/vservices/query"
@@ -38,12 +39,12 @@ import (
 // upload.
 //
 // EVERY CALL NAMES ITS TENANT. Stratum is tenant_owned: each tenant has its
-// own instance, and a row lives in the instance of the tenant its namespace
-// belongs to (/tenants/<tid>). tenant is that tid, sent as the plane's
-// target_tenant, and it is the only thing that decides which instance a call
-// reaches. blobstore is tenant_owned too (#9): an instance serves one tenant and
-// names only that tenant, so every call is a same-tenant call to its own
-// tenant's Stratum.
+// own instance, which holds the rows of its tenant's namespace, /tenants/<name>,
+// and below. tenant is that tenant's tid, sent as the plane's target_tenant, and
+// it is the only thing that decides which instance a call reaches: a namespace
+// names its tenant, never its tid (tacplus-dev/tacplus#284). blobstore is
+// tenant_owned too (#9): an instance serves one tenant and names only that
+// tenant, so every call is a same-tenant call to its own tenant's Stratum.
 //
 // EVERY CALL CARRIES ITS CAUSE'S TRACE (tacplus-dev/looper#51). An RPC handler
 // puts its request's trace_id in the context (withTrace), and every request a
@@ -97,21 +98,13 @@ var (
 	ErrRecordOutsideTenant = errors.New("record is outside the tenant the call is routed to")
 )
 
-// NamespaceTenant returns the tenant a namespace belongs to: the tid of
-// /tenants/<tid>, or of any namespace below it. Any other namespace (/system,
-// "/") belongs to no tenant, and blobstore keeps no row there: there is no
-// Stratum to hold it.
-func NamespaceTenant(namespace string) (string, bool) {
-	return serviceconnection.NamespaceTenant(namespace)
-}
-
 // ValidTenantID reports whether s is a tid: 8 characters of [0-9a-z].
 func ValidTenantID(s string) bool { return serviceconnection.ValidTenantID(s) }
 
-// inTenant reports whether namespace is tenant's.
-func inTenant(tenant, namespace string) bool {
-	tid, ok := NamespaceTenant(namespace)
-	return ok && tid == tenant
+// inNamespace reports whether namespace is within (a tenant's namespace,
+// /tenants/<name>) or below it. An empty within holds nothing.
+func inNamespace(within, namespace string) bool {
+	return within != "" && (namespace == within || strings.HasPrefix(namespace, within+"/"))
 }
 
 // storeError names what a store call was doing and maps its answer onto the
@@ -169,18 +162,22 @@ const recordPageSize = 100
 //
 // THE TENANT IS CHECKED HERE ON BOTH SIDES OF A CALL, as well as by the store. A
 // call that names no tid is refused before it is sent; a write of a row outside
-// /tenants/<tenant> is refused before it is sent; and a row read back that is
+// the tenant's namespace is refused before it is sent; and a row read back that is
 // not the tenant's is treated as absent (a list or a watch drops it). The
 // generated client routes each call by its target_tenant and the store refuses
 // a call or a row of another tenant (tacplus-dev/tacplus#207); these checks are
 // the same rule, applied before anything is sent.
 type recordStore struct {
 	records *query_gc.RecordMapClient
+	// namespace is the namespace of the tenant this instance serves,
+	// /tenants/<name>: its Stratum holds rows there and below, and nowhere else.
+	namespace string
 }
 
-// NewRecords wires Records over the generated record plane client.
-func NewRecords(records *query_gc.RecordMapClient) Records {
-	return &recordStore{records: records}
+// NewRecords wires Records over the generated record plane client, for the
+// tenant whose namespace is namespace.
+func NewRecords(records *query_gc.RecordMapClient, namespace string) Records {
+	return &recordStore{records: records, namespace: namespace}
 }
 
 // FetchBlob reads one blob row by key with Get<T>. A missing row is (nil, nil) —
@@ -199,7 +196,7 @@ func (r *recordStore) FetchBlob(ctx context.Context, tenant, blobID string) (*bl
 		return nil, err
 	}
 	resp, err := r.records.GetBlob(ctx, &query_pb.GetBlobRequest{BlobId: blobID, TargetTenant: tenant, TraceId: traceOf(ctx)})
-	return absentIsNil(tenant, resp.GetItem(), err, "reading Blob")
+	return absentIsNil(r.namespace, resp.GetItem(), err, "reading Blob")
 }
 
 func (r *recordStore) ListBlobsInGroup(ctx context.Context, tenant, group string) ([]*blobstore_pb.Blob, error) {
@@ -219,7 +216,7 @@ func (r *recordStore) ListBlobsInGroup(ctx context.Context, tenant, group string
 	rows, err := drain(ctx, handle.GetQueryId(), r.records.ListBlobPage, func(queryID, token string) *query_pb.PullBlobRequest {
 		return &query_pb.PullBlobRequest{QueryId: queryID, PageSize: recordPageSize, PageToken: token, TargetTenant: tenant, TraceId: trace}
 	})
-	return tenantRows(tenant, rows, err)
+	return tenantRows(r.namespace, rows, err)
 }
 
 func (r *recordStore) FetchLink(ctx context.Context, tenant, tokenHash string) (*blobstore_pb.BlobLink, error) {
@@ -228,7 +225,7 @@ func (r *recordStore) FetchLink(ctx context.Context, tenant, tokenHash string) (
 	}
 	resp, err := r.records.GetBlobLink(ctx, &query_pb.GetBlobLinkRequest{TokenHash: tokenHash, TargetTenant: tenant, TraceId: traceOf(ctx)})
 	// The key is a hash of a credential, so it is never put in an error.
-	return absentIsNil(tenant, resp.GetItem(), err, "reading BlobLink")
+	return absentIsNil(r.namespace, resp.GetItem(), err, "reading BlobLink")
 }
 
 func (r *recordStore) ListLinksForBlob(ctx context.Context, tenant, blobID, namespace string) ([]*blobstore_pb.BlobLink, error) {
@@ -248,7 +245,7 @@ func (r *recordStore) ListLinksForBlob(ctx context.Context, tenant, blobID, name
 	rows, err := drain(ctx, handle.GetQueryId(), r.records.ListBlobLinkPage, func(queryID, token string) *query_pb.PullBlobLinkRequest {
 		return &query_pb.PullBlobLinkRequest{QueryId: queryID, PageSize: recordPageSize, PageToken: token, TargetTenant: tenant, TraceId: trace}
 	})
-	return tenantRows(tenant, rows, err)
+	return tenantRows(r.namespace, rows, err)
 }
 
 func (r *recordStore) FetchSession(ctx context.Context, tenant, uploadID string) (*blobstore_pb.UploadSession, error) {
@@ -256,7 +253,7 @@ func (r *recordStore) FetchSession(ctx context.Context, tenant, uploadID string)
 		return nil, err
 	}
 	resp, err := r.records.GetUploadSession(ctx, &query_pb.GetUploadSessionRequest{UploadId: uploadID, TargetTenant: tenant, TraceId: traceOf(ctx)})
-	return absentIsNil(tenant, resp.GetItem(), err, "reading UploadSession")
+	return absentIsNil(r.namespace, resp.GetItem(), err, "reading UploadSession")
 }
 
 // ListExpiredSessions uses the record's RANGE filter on expires_ms rather than
@@ -280,7 +277,7 @@ func (r *recordStore) ListExpiredSessions(ctx context.Context, tenant string, no
 	rows, err := drain(ctx, handle.GetQueryId(), r.records.ListUploadSessionPage, func(queryID, token string) *query_pb.PullUploadSessionRequest {
 		return &query_pb.PullUploadSessionRequest{QueryId: queryID, PageSize: recordPageSize, PageToken: token, TargetTenant: tenant, TraceId: trace}
 	})
-	return tenantRows(tenant, rows, err)
+	return tenantRows(r.namespace, rows, err)
 }
 
 func (r *recordStore) FetchLinkStats(ctx context.Context, tenant, tokenHash string) (*blobstore_pb.BlobLinkStats, error) {
@@ -288,7 +285,7 @@ func (r *recordStore) FetchLinkStats(ctx context.Context, tenant, tokenHash stri
 		return nil, err
 	}
 	resp, err := r.records.GetBlobLinkStats(ctx, &query_pb.GetBlobLinkStatsRequest{TokenHash: tokenHash, TargetTenant: tenant, TraceId: traceOf(ctx)})
-	return absentIsNil(tenant, resp.GetItem(), err, "reading BlobLinkStats")
+	return absentIsNil(r.namespace, resp.GetItem(), err, "reading BlobLinkStats")
 }
 
 // namespaced is every record type here: each carries its owning namespace.
@@ -302,14 +299,14 @@ func routable(tenant string) error {
 	return nil
 }
 
-// tenantRows keeps the tenant's rows of a list.
-func tenantRows[T namespaced](tenant string, rows []T, err error) ([]T, error) {
+// tenantRows keeps the rows of a list in the tenant's namespace.
+func tenantRows[T namespaced](namespace string, rows []T, err error) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
 	out := rows[:0]
 	for _, row := range rows {
-		if inTenant(tenant, row.GetNamespace()) {
+		if inNamespace(namespace, row.GetNamespace()) {
 			out = append(out, row)
 		}
 	}
@@ -319,12 +316,12 @@ func tenantRows[T namespaced](tenant string, rows []T, err error) ([]T, error) {
 // writable refuses, before it is sent, a write that names no tenant or whose
 // rows (the one written and, for a replace, the one expected) are not the
 // tenant's.
-func writable(tenant string, rows ...namespaced) error {
+func (r *recordStore) writable(tenant string, rows ...namespaced) error {
 	if err := routable(tenant); err != nil {
 		return err
 	}
 	for _, row := range rows {
-		if !inTenant(tenant, row.GetNamespace()) {
+		if !inNamespace(r.namespace, row.GetNamespace()) {
 			return fmt.Errorf("row of namespace %q written to tenant %s: %w", row.GetNamespace(), tenant, ErrRecordOutsideTenant)
 		}
 	}
@@ -337,7 +334,7 @@ func writable(tenant string, rows ...namespaced) error {
 func absentIsNil[T any, P interface {
 	*T
 	namespaced
-}](tenant string, row P, err error, what string) (P, error) {
+}](namespace string, row P, err error, what string) (P, error) {
 	if status.Code(err) == codes.NotFound {
 		return nil, nil
 	}
@@ -347,7 +344,7 @@ func absentIsNil[T any, P interface {
 	if row == nil {
 		return nil, fmt.Errorf("%s: the store answered with no row", what)
 	}
-	if !inTenant(tenant, row.GetNamespace()) {
+	if !inNamespace(namespace, row.GetNamespace()) {
 		return nil, nil
 	}
 	return row, nil
@@ -358,7 +355,7 @@ func absentIsNil[T any, P interface {
 // state it.
 
 func (r *recordStore) PutBlob(ctx context.Context, tenant string, rec *blobstore_pb.Blob) error {
-	if err := writable(tenant, rec); err != nil {
+	if err := r.writable(tenant, rec); err != nil {
 		return err
 	}
 	_, err := r.records.PutBlob(ctx, &query_pb.PutBlobRequest{Item: rec, TargetTenant: tenant, TraceId: traceOf(ctx)})
@@ -366,7 +363,7 @@ func (r *recordStore) PutBlob(ctx context.Context, tenant string, rec *blobstore
 }
 
 func (r *recordStore) ReplaceBlob(ctx context.Context, tenant string, prev, next *blobstore_pb.Blob) error {
-	if err := writable(tenant, prev, next); err != nil {
+	if err := r.writable(tenant, prev, next); err != nil {
 		return err
 	}
 	_, err := r.records.ReplaceIfUnchangedBlob(ctx, &query_pb.ReplaceIfUnchangedBlobRequest{
@@ -379,7 +376,7 @@ func (r *recordStore) ReplaceBlob(ctx context.Context, tenant string, prev, next
 }
 
 func (r *recordStore) InsertSession(ctx context.Context, tenant string, rec *blobstore_pb.UploadSession) error {
-	if err := writable(tenant, rec); err != nil {
+	if err := r.writable(tenant, rec); err != nil {
 		return err
 	}
 	_, err := r.records.InsertIfAbsentUploadSession(ctx, &query_pb.InsertIfAbsentUploadSessionRequest{Item: rec, TargetTenant: tenant, TraceId: traceOf(ctx)})
@@ -387,7 +384,7 @@ func (r *recordStore) InsertSession(ctx context.Context, tenant string, rec *blo
 }
 
 func (r *recordStore) ReplaceSession(ctx context.Context, tenant string, prev, next *blobstore_pb.UploadSession) error {
-	if err := writable(tenant, prev, next); err != nil {
+	if err := r.writable(tenant, prev, next); err != nil {
 		return err
 	}
 	_, err := r.records.ReplaceIfUnchangedUploadSession(ctx, &query_pb.ReplaceIfUnchangedUploadSessionRequest{
@@ -400,7 +397,7 @@ func (r *recordStore) ReplaceSession(ctx context.Context, tenant string, prev, n
 }
 
 func (r *recordStore) InsertLink(ctx context.Context, tenant string, rec *blobstore_pb.BlobLink) error {
-	if err := writable(tenant, rec); err != nil {
+	if err := r.writable(tenant, rec); err != nil {
 		return err
 	}
 	_, err := r.records.InsertIfAbsentBlobLink(ctx, &query_pb.InsertIfAbsentBlobLinkRequest{Item: rec, TargetTenant: tenant, TraceId: traceOf(ctx)})
@@ -408,7 +405,7 @@ func (r *recordStore) InsertLink(ctx context.Context, tenant string, rec *blobst
 }
 
 func (r *recordStore) ReplaceLink(ctx context.Context, tenant string, prev, next *blobstore_pb.BlobLink) error {
-	if err := writable(tenant, prev, next); err != nil {
+	if err := r.writable(tenant, prev, next); err != nil {
 		return err
 	}
 	_, err := r.records.ReplaceIfUnchangedBlobLink(ctx, &query_pb.ReplaceIfUnchangedBlobLinkRequest{
@@ -421,7 +418,7 @@ func (r *recordStore) ReplaceLink(ctx context.Context, tenant string, prev, next
 }
 
 func (r *recordStore) InsertLinkStats(ctx context.Context, tenant string, rec *blobstore_pb.BlobLinkStats) error {
-	if err := writable(tenant, rec); err != nil {
+	if err := r.writable(tenant, rec); err != nil {
 		return err
 	}
 	_, err := r.records.InsertIfAbsentBlobLinkStats(ctx, &query_pb.InsertIfAbsentBlobLinkStatsRequest{Item: rec, TargetTenant: tenant, TraceId: traceOf(ctx)})
@@ -429,7 +426,7 @@ func (r *recordStore) InsertLinkStats(ctx context.Context, tenant string, rec *b
 }
 
 func (r *recordStore) ReplaceLinkStats(ctx context.Context, tenant string, prev, next *blobstore_pb.BlobLinkStats) error {
-	if err := writable(tenant, prev, next); err != nil {
+	if err := r.writable(tenant, prev, next); err != nil {
 		return err
 	}
 	_, err := r.records.ReplaceIfUnchangedBlobLinkStats(ctx, &query_pb.ReplaceIfUnchangedBlobLinkStatsRequest{
@@ -470,7 +467,7 @@ func (r *recordStore) WatchBlobs(ctx context.Context, tenant string) (iter.Seq2[
 		return nil, err
 	}
 	events, err := r.records.WatchBlobChanges(ctx, &query_pb.WatchBlobChangesRequest{TargetTenant: tenant, TraceId: traceOf(ctx)})
-	return changes[blobstore_pb.Blob, *blobstore_pb.Blob](tenant, events, err)
+	return changes[blobstore_pb.Blob, *blobstore_pb.Blob](r.namespace, events, err)
 }
 
 func (r *recordStore) WatchSessions(ctx context.Context, tenant string) (iter.Seq2[RecordChange[blobstore_pb.UploadSession], error], error) {
@@ -478,7 +475,7 @@ func (r *recordStore) WatchSessions(ctx context.Context, tenant string) (iter.Se
 		return nil, err
 	}
 	events, err := r.records.WatchUploadSessionChanges(ctx, &query_pb.WatchUploadSessionChangesRequest{TargetTenant: tenant, TraceId: traceOf(ctx)})
-	return changes[blobstore_pb.UploadSession, *blobstore_pb.UploadSession](tenant, events, err)
+	return changes[blobstore_pb.UploadSession, *blobstore_pb.UploadSession](r.namespace, events, err)
 }
 
 func (r *recordStore) WatchLinks(ctx context.Context, tenant string) (iter.Seq2[RecordChange[blobstore_pb.BlobLink], error], error) {
@@ -486,7 +483,7 @@ func (r *recordStore) WatchLinks(ctx context.Context, tenant string) (iter.Seq2[
 		return nil, err
 	}
 	events, err := r.records.WatchBlobLinkChanges(ctx, &query_pb.WatchBlobLinkChangesRequest{TargetTenant: tenant, TraceId: traceOf(ctx)})
-	return changes[blobstore_pb.BlobLink, *blobstore_pb.BlobLink](tenant, events, err)
+	return changes[blobstore_pb.BlobLink, *blobstore_pb.BlobLink](r.namespace, events, err)
 }
 
 func (r *recordStore) WatchLinkStats(ctx context.Context, tenant string) (iter.Seq2[RecordChange[blobstore_pb.BlobLinkStats], error], error) {
@@ -494,7 +491,7 @@ func (r *recordStore) WatchLinkStats(ctx context.Context, tenant string) (iter.S
 		return nil, err
 	}
 	events, err := r.records.WatchBlobLinkStatsChanges(ctx, &query_pb.WatchBlobLinkStatsChangesRequest{TargetTenant: tenant, TraceId: traceOf(ctx)})
-	return changes[blobstore_pb.BlobLinkStats, *blobstore_pb.BlobLinkStats](tenant, events, err)
+	return changes[blobstore_pb.BlobLinkStats, *blobstore_pb.BlobLinkStats](r.namespace, events, err)
 }
 
 // watchEvent and watchDelta are the generated <T>WatchEvent and <T>WatchChange
@@ -516,7 +513,7 @@ type watchDelta[T any] interface {
 func changes[T any, P interface {
 	*T
 	namespaced
-}, D watchDelta[T], E watchEvent[T, D]](tenant string, events iter.Seq2[E, error], err error) (iter.Seq2[RecordChange[T], error], error) {
+}, D watchDelta[T], E watchEvent[T, D]](namespace string, events iter.Seq2[E, error], err error) (iter.Seq2[RecordChange[T], error], error) {
 	if err != nil {
 		return nil, storeError("opening watch", err)
 	}
@@ -538,7 +535,7 @@ func changes[T any, P interface {
 			} else {
 				continue
 			}
-			if !inTenant(tenant, P(c.Row).GetNamespace()) {
+			if !inNamespace(namespace, P(c.Row).GetNamespace()) {
 				continue
 			}
 			if !yield(c, nil) {

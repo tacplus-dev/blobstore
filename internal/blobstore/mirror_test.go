@@ -17,10 +17,11 @@ import (
 // own words. The harness stands up the real pair; see harness_test.go.
 
 // testNS is testTenant's namespace: every row of the tests is a tenant's, in
-// that tenant's own store.
+// that tenant's own store. A namespace names its tenant, never its tid
+// (tacplus-dev/tacplus#284), so the two differ here as they do in a cluster.
 const (
 	testTenant = "acme0001"
-	testNS     = "/tenants/" + testTenant
+	testNS     = "/tenants/acme"
 )
 
 var pdfBody = []byte("%PDF-1.7\nhello blob store\n")

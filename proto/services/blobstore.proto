@@ -15,14 +15,15 @@
 // a row (R3, R7). There is no signing key anywhere in this service.
 //
 // ONE INSTANCE PER TENANT (#9). blobstore is tenant_owned: each tenant has its
-// own instance in /tenants/<tid>, with its own two pods, its own PVCs holding
+// own instance in /tenants/<name>, with its own two pods, its own PVCs holding
 // only that tenant's bytes (`<data_dir>/<group>/<sha256>`), and its own
 // Stratum for the rows, reached as a same-tenant call. Nothing in /system holds
 // or serves a tenant's blobs, and no instance calls into another tenant
 // (tacplus-dev/roadmap decisions/s2s-never-crosses-tenants-2026-10-31.md,
 // addendum 2026-11-01). Every rpc names its target tenant in `tenant`, its
 // route field, and the byte paths name it before the token (`<tid>`, the
-// 8-character id of the namespace /tenants/<tid>): the gateway sends both to
+// tenant's 8-character id; its namespace /tenants/<name> names it, never its
+// tid, tacplus-dev/tacplus#284): the gateway sends both to
 // that tenant's instance. The tid is not a secret and grants nothing. An
 // instance refuses a request routed to another tenant, a row namespace other
 // than its own tenant's, and a caller from outside its tenant (/system
@@ -339,7 +340,7 @@ message Blob {
     (spec.query_field) = {op: QUERY_OP_EQ}
   ];
 
-  // namespace is the OWNING TENANT (R6): /tenants/<tid> of the instance that
+  // namespace is the OWNING TENANT (R6): /tenants/<name> of the instance that
   // holds the row, and the store's tenant check on it. Dedup is per tenant
   // because each tenant's rows and files are on its own instance.
   string namespace = 10 [

@@ -276,7 +276,7 @@ func (f *fakeStratum) write(tenant, typ, key string, op fakeWrite, row, expected
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.routed = append(f.routed, tenant)
-	if ns := row.(namespaced).GetNamespace(); !inTenant(tenant, ns) {
+	if ns := row.(namespaced).GetNamespace(); !inNamespace(tenantNS(tenant), ns) {
 		return nil, status.Errorf(codes.PermissionDenied, "row of %q is not in tenant %q", ns, tenant)
 	}
 	if f.redoDown {
@@ -535,7 +535,7 @@ func newStratumRecords(t *testing.T) (*recordStore, *fakeStratum) {
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	client := query_gc.NewRecordMapClient(conn, func() (string, error) { return "test-token", nil })
-	return NewRecords(client).(*recordStore), fake
+	return NewRecords(client, testNS).(*recordStore), fake
 }
 
 // recordCase is one record type's slice of the surface: insert one row, read it
